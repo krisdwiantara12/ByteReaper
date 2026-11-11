@@ -1,11 +1,13 @@
 import SwiftUI
 
-/// Glass Surface #1 of 2: Sticky top storage telemetry HUD showing real iPhone capacity,
+/// Glass Surface #1 of 2: Pinned top storage telemetry HUD showing real iPhone capacity,
 /// purgeable headroom, and total bytes reclaimed in this session.
+/// Automatically condenses when `isCompact` is true to maximize list space during scrolling.
 struct StorageHUDCard: View {
     let snapshot: DeviceStorageSnapshot
     let reclaimedBytes: Int64
     let isScanning: Bool
+    var isCompact: Bool = false
     let onRefresh: () -> Void
 
     private var isCritical: Bool {
@@ -17,23 +19,25 @@ struct StorageHUDCard: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: isCompact ? 8 : 12) {
             HStack(alignment: .center, spacing: 10) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("BYTEREAPER")
-                        .font(.caption.weight(.bold))
-                        .foregroundStyle(CyberTheme.cyberCyan)
-                        .accessibilityLabel("ByteReaper")
+                    if !isCompact {
+                        Text("BYTEREAPER")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(CyberTheme.cyberCyan)
+                            .accessibilityLabel("ByteReaper")
+                    }
 
                     if snapshot.totalBytes > 0 {
                         HStack(alignment: .firstTextBaseline, spacing: 6) {
                             Text(ByteFormatter.string(from: snapshot.usedBytes))
-                                .font(.title2.weight(.bold))
+                                .font((isCompact ? Font.headline : Font.title2).weight(.bold))
                                 .monospacedDigit()
                                 .foregroundStyle(CyberTheme.textPrimary)
 
                             Text("dari \(ByteFormatter.string(from: snapshot.totalBytes))")
-                                .font(.subheadline)
+                                .font(isCompact ? .caption : .subheadline)
                                 .monospacedDigit()
                                 .foregroundStyle(CyberTheme.textSecondary)
                         }
@@ -45,6 +49,16 @@ struct StorageHUDCard: View {
                 }
 
                 Spacer()
+
+                if isCompact && reclaimedBytes > 0 {
+                    Text("+\(ByteFormatter.string(from: reclaimedBytes))")
+                        .font(.caption2.weight(.bold))
+                        .monospacedDigit()
+                        .foregroundStyle(CyberTheme.mintInk)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(CyberTheme.acidMint, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                }
 
                 Button(action: onRefresh) {
                     Image(systemName: isScanning ? "stop.circle" : "arrow.clockwise")
@@ -66,7 +80,7 @@ struct StorageHUDCard: View {
                 ZStack(alignment: .leading) {
                     RoundedRectangle(cornerRadius: 6, style: .continuous)
                         .fill(CyberTheme.oledBlack.opacity(0.85))
-                        .frame(height: 10)
+                        .frame(height: isCompact ? 7 : 10)
                         .overlay(
                             RoundedRectangle(cornerRadius: 6, style: .continuous)
                                 .strokeBorder(CyberTheme.hairlineBorder, lineWidth: 1)
@@ -74,45 +88,47 @@ struct StorageHUDCard: View {
 
                     RoundedRectangle(cornerRadius: 6, style: .continuous)
                         .fill(barColor)
-                        .frame(width: snapshot.totalBytes > 0 ? fillWidth : 0, height: 10)
+                        .frame(width: snapshot.totalBytes > 0 ? fillWidth : 0, height: isCompact ? 7 : 10)
                         .shadow(color: barColor.opacity(0.32), radius: 8, x: 0, y: 0)
                         .animation(.easeOut(duration: 0.25), value: snapshot.usedFraction)
                 }
             }
-            .frame(height: 10)
+            .frame(height: isCompact ? 7 : 10)
 
-            HStack(spacing: 12) {
-                Label {
-                    Text("Tersedia \(ByteFormatter.string(from: snapshot.availableImportantBytes))")
-                        .font(.caption)
-                        .monospacedDigit()
-                        .foregroundStyle(CyberTheme.textSecondary)
-                } icon: {
-                    Image(systemName: "internaldrive")
-                        .font(.caption)
-                        .foregroundStyle(CyberTheme.cyberCyan)
-                }
+            if !isCompact {
+                HStack(spacing: 12) {
+                    Label {
+                        Text("Tersedia \(ByteFormatter.string(from: snapshot.availableImportantBytes))")
+                            .font(.caption)
+                            .monospacedDigit()
+                            .foregroundStyle(CyberTheme.textSecondary)
+                    } icon: {
+                        Image(systemName: "internaldrive")
+                            .font(.caption)
+                            .foregroundStyle(CyberTheme.cyberCyan)
+                    }
 
-                Spacer()
+                    Spacer()
 
-                if reclaimedBytes > 0 {
-                    Text("+\(ByteFormatter.string(from: reclaimedBytes)) dihapus")
-                        .font(.caption.weight(.semibold))
-                        .monospacedDigit()
-                        .foregroundStyle(CyberTheme.mintInk)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 3)
-                        .background(CyberTheme.acidMint, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
-                } else if snapshot.purgeableEstimateBytes > 0 {
-                    Text("Cache iOS ~\(ByteFormatter.string(from: snapshot.purgeableEstimateBytes))")
-                        .font(.caption)
-                        .monospacedDigit()
-                        .foregroundStyle(CyberTheme.textSecondary)
+                    if reclaimedBytes > 0 {
+                        Text("+\(ByteFormatter.string(from: reclaimedBytes)) dihapus")
+                            .font(.caption.weight(.semibold))
+                            .monospacedDigit()
+                            .foregroundStyle(CyberTheme.mintInk)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(CyberTheme.acidMint, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                    } else if snapshot.purgeableEstimateBytes > 0 {
+                        Text("Cache iOS ~\(ByteFormatter.string(from: snapshot.purgeableEstimateBytes))")
+                            .font(.caption)
+                            .monospacedDigit()
+                            .foregroundStyle(CyberTheme.textSecondary)
+                    }
                 }
             }
         }
-        .padding(16)
-        .cyberGlass(cornerRadius: 22, accentGlow: false)
+        .padding(isCompact ? 12 : 16)
+        .cyberGlass(cornerRadius: isCompact ? 18 : 22, accentGlow: false)
+        .animation(.easeInOut(duration: 0.2), value: isCompact)
     }
 }
-

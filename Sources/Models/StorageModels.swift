@@ -41,8 +41,36 @@ enum MediaCategoryFilter: String, CaseIterable, Identifiable {
     case screenshots = "Screenshot"
     case liveAndBurst = "Live/Burst"
     case duplicates = "Duplikat"
+    case similar = "Mirip"
 
     var id: String { rawValue }
+}
+
+/// File extension groups for the Files/Downloads scanner.
+enum FileCategoryFilter: String, CaseIterable, Identifiable {
+    case all = "Semua"
+    case video = "Video"
+    case image = "Foto"
+    case archive = "Arsip/IPA"
+    case document = "Dokumen"
+
+    var id: String { rawValue }
+
+    func matches(extension ext: String) -> Bool {
+        let lower = ext.lowercased()
+        switch self {
+        case .all:
+            return true
+        case .video:
+            return ["mp4", "mov", "m4v", "mkv", "avi", "webm"].contains(lower)
+        case .image:
+            return ["jpg", "jpeg", "png", "heic", "heif", "webp", "gif", "raw", "dng"].contains(lower)
+        case .archive:
+            return ["zip", "rar", "7z", "tar", "gz", "ipa", "dmg"].contains(lower)
+        case .document:
+            return ["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "md", "csv", "json"].contains(lower)
+        }
+    }
 }
 
 /// Protocol enabling duplicate grouping and testing without instantiating PhotoKit objects.
@@ -68,6 +96,7 @@ struct MediaAssetItem: DuplicateGroupable {
     let isScreenshot: Bool
     let isLivePhoto: Bool
     let isBurst: Bool
+    let isLocallyAvailable: Bool
 
     var mediaTypeRaw: Int { mediaType.rawValue }
     var isVideo: Bool { mediaType == .video }
@@ -100,6 +129,38 @@ struct DuplicateGroupGeneric<Item: DuplicateGroupable>: Identifiable, Hashable {
 }
 
 typealias DuplicateGroup = DuplicateGroupGeneric<MediaAssetItem>
+
+/// Group of visually similar photos detected offline using Apple Vision feature prints.
+struct SimilarPhotoGroup: Identifiable, Hashable {
+    let id: String
+    let averageSimilarityPercent: Int
+    /// Sorted oldest-first so index 0 is suggested to keep and index 1... can be removed.
+    let items: [MediaAssetItem]
+
+    var reclaimableBytes: Int64 {
+        guard items.count > 1 else { return 0 }
+        return items.dropFirst().reduce(0) { $0 + $1.byteSize }
+    }
+}
+
+/// Export presets for shrinking huge MOV/4K videos directly inside ByteReaper.
+enum VideoCompressionPreset: String, CaseIterable, Identifiable {
+    case hevc1080p = "HEVC 1080p (Hemat)"
+    case mp41080p = "MP4 H.264 1080p"
+
+    var id: String { rawValue }
+}
+
+/// Result summary returned after compressing a video and saving the smaller copy to Photos.
+struct VideoCompressionResult: Equatable {
+    let originalBytes: Int64
+    let compressedBytes: Int64
+    let savedLocalIdentifier: String
+
+    var savedBytes: Int64 {
+        max(0, originalBytes - compressedBytes)
+    }
+}
 
 /// File discovered inside a user-selected Files/On My iPhone/iCloud Drive folder.
 struct ScannedFileItem: Identifiable, Hashable {
@@ -136,4 +197,3 @@ struct AppCleanupChecklistItem: Identifiable, Codable, Equatable {
     let steps: String
     var isCompleted: Bool
 }
-

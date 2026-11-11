@@ -2,13 +2,16 @@ import Photos
 import SwiftUI
 
 /// Scans PhotoKit assets, ranks them strictly from largest byte size to smallest,
-/// supports category filtering, preview playback, SHA-256 duplicate grouping, and batch delete.
+/// supports category filtering, Local-only toggle, preview & video compression,
+/// SHA-256 duplicates, Vision similar photos, and batch delete.
 struct MediaCleanerView: View {
     @ObservedObject var scanner: PhotoScannerService
     @Binding var selectedIds: Set<String>
     let onSingleDelete: (MediaAssetItem) -> Void
+    let onVideoCompressed: () -> Void
 
     @State private var activeFilter: MediaCategoryFilter = .allLargest
+    @State private var localOnly: Bool = false
     @State private var searchText: String = ""
     @State private var previewItem: MediaAssetItem?
 
@@ -17,6 +20,9 @@ struct MediaCleanerView: View {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
 
         let categoryFiltered = allItems.filter { item in
+            if localOnly && !item.isLocallyAvailable {
+                return false
+            }
             switch activeFilter {
             case .allLargest:
                 return true
@@ -26,7 +32,7 @@ struct MediaCleanerView: View {
                 return item.isScreenshot
             case .liveAndBurst:
                 return item.isLivePhoto || item.isBurst
-            case .duplicates:
+            case .duplicates, .similar:
                 return false
             }
         }
@@ -45,6 +51,27 @@ struct MediaCleanerView: View {
         VStack(spacing: 12) {
             filterStrip
 
+            if let bgStatus = scanner.backgroundPhotoScanStatus {
+                HStack(spacing: 10) {
+                    ProgressView()
+                        .tint(CyberTheme.cyberCyan)
+                        .scaleEffect(0.85)
+                    Text(bgStatus)
+                        .font(.caption)
+                        .monospacedDigit()
+                        .foregroundStyle(CyberTheme.textSecondary)
+                    Spacer()
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(CyberTheme.elevatedSurface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .strokeBorder(CyberTheme.cyberCyan.opacity(0.3), lineWidth: 1)
+                )
+                .padding(.horizontal, 16)
+            }
+
             switch scanner.phase {
             case .idle:
                 idleStateCard
@@ -59,19 +86,26 @@ struct MediaCleanerView: View {
                     emptyStateCard(title: "Galeri Foto Kosong", detail: "Tidak ditemukan foto atau video yang tersimpan di perpustakaan foto.")
                 } else if activeFilter == .duplicates {
                     duplicatesSection
+                } else if activeFilter == .similar {
+                    similarSection
                 } else {
                     loadedMediaList
                 }
             }
         }
         .sheet(item: $previewItem) { item in
-            MediaPreviewSheet(item: item, scanner: scanner) {
-                onSingleDelete(item)
-            }
+            MediaPreviewSheet(
+                item: item,
+                scanner: scanner,
+                onDelete: { onSingleDelete(item) },
+                onCompressedAndSaved: onVideoCompressed
+            )
         }
         .onChange(of: activeFilter) { newValue in
             if newValue == .duplicates {
                 scanner.findDuplicatesIfNeeded()
+            } else if newValue == .similar {
+                scanner.findSimilarPhotosIfNeeded()
             }
         }
     }
@@ -84,6 +118,7 @@ struct MediaCleanerView: View {
                 ForEach(MediaCategoryFilter.allCases) { filter in
                     let isSelected = activeFilter == filter
                     Button {
+                        HapticFeedback.selection()
                         withAnimation(.easeInOut(duration: 0.16)) {
                             activeFilter = filter
                         }
@@ -129,9 +164,29 @@ struct MediaCleanerView: View {
                 )
 
                 Button {
+                    HapticFeedback.selection()
+                    localOnly.toggle()
+                } label: {
+                    Text("Lokal")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(localOnly ? CyberTheme.cyanInk : CyberTheme.textSecondary)
+                        .padding(.horizontal, 12)
+                        .frame(minHeight: 44)
+                        .background(
+                            localOnly ? CyberTheme.cyberCyan : CyberTheme.elevatedSurface,
+                            in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .strokeBorder(localOnly ? CyberTheme.cyberCyan : CyberTheme.hairlineBorder, lineWidth: 1)
+                        )
+                }
+                .accessibilityLabel("Filter hanya file lokal di memori iPhone")
+
+                Button {
                     toggleSelectTopTen()
                 } label: {
-                    Text(selectedIds.isEmpty ? "Pilih Top 10" : "Reset Pilih")
+                    Text(selectedIds.isEmpty ? "Top 10" : "Reset")
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(CyberTheme.cyberCyan)
                         .padding(.horizontal, 12)
@@ -195,7 +250,7 @@ struct MediaCleanerView: View {
                             .foregroundStyle(CyberTheme.textSecondary)
                         Spacer()
                         Button {
-                            selectAllDuplicateCopies(in: groups)
+                            selectAllDuplicateCopies(in: groups.map(\.items))
                         } label: {
                             Text("Pilih Semua Salinan")
                                 .font(.caption.weight(.semibold))
@@ -213,10 +268,73 @@ struct MediaCleanerView: View {
 
                     LazyVStack(spacing: 12) {
                         ForEach(groups) { group in
-                            DuplicateGroupCard(
-                                group: group,
+                            ClusterGroupCard(
+                                headerTitle: "\(group.items.count) salinan identik",
+                                savingsText: "Hemat \(ByteFormatter.string(from: group.reclaimableBytes))",
+                                secondaryTag: "SALINAN",
+                                items: group.items,
                                 selectedIds: $selectedIds,
-                                scanner: scanner,
+                                onPreview: { previewItem = $0 }
+                            )
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 110)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var similarSection: some View {
+        switch scanner.similarPhase {
+        case .idle:
+            scanningStateCard(processed: 0, total: 0, statusText: "Menyiapkan analisis Vision untuk foto mirip...")
+                .onAppear { scanner.findSimilarPhotosIfNeeded() }
+        case .scanning(let processed, let total, let statusText):
+            scanningStateCard(processed: processed, total: total, statusText: statusText)
+        case .permissionDenied:
+            permissionDeniedCard
+        case .error(let msg):
+            errorStateCard(message: msg)
+        case .loaded(let groups):
+            if groups.isEmpty {
+                emptyStateCard(
+                    title: "Tidak Ada Foto Mirip",
+                    detail: "Tidak ditemukan rangkaian foto lokal yang hampir sama dalam 24 jam berdekatan."
+                )
+            } else {
+                VStack(spacing: 10) {
+                    HStack {
+                        Text("\(groups.count) grup foto mirip (Vision offline)")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(CyberTheme.textSecondary)
+                        Spacer()
+                        Button {
+                            selectAllDuplicateCopies(in: groups.map(\.items))
+                        } label: {
+                            Text("Pilih Semua Salinan")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(CyberTheme.cyberCyan)
+                                .padding(.horizontal, 12)
+                                .frame(minHeight: 44)
+                                .background(CyberTheme.elevatedSurface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                        .strokeBorder(CyberTheme.hairlineBorder, lineWidth: 1)
+                                )
+                        }
+                    }
+                    .padding(.horizontal, 16)
+
+                    LazyVStack(spacing: 12) {
+                        ForEach(groups) { group in
+                            ClusterGroupCard(
+                                headerTitle: "\(group.items.count) foto · ~\(group.averageSimilarityPercent)% mirip",
+                                savingsText: "Hemat \(ByteFormatter.string(from: group.reclaimableBytes))",
+                                secondaryTag: "MIRIP",
+                                items: group.items,
+                                selectedIds: $selectedIds,
                                 onPreview: { previewItem = $0 }
                             )
                         }
@@ -238,7 +356,7 @@ struct MediaCleanerView: View {
                 .font(.headline)
                 .foregroundStyle(CyberTheme.textPrimary)
 
-            Text("ByteReaper menghitung ukuran asli tiap aset di galeri Anda, termasuk video 4K/MOV dan Live Photo, lalu mengurutkannya dari yang paling besar.")
+            Text("ByteReaper memindai video terbesar lebih dulu agar langsung tampil cepat, menandai file Lokal vs iCloud, dan mengurutkannya dari ukuran terbesar.")
                 .font(.subheadline)
                 .foregroundStyle(CyberTheme.textSecondary)
                 .multilineTextAlignment(.center)
@@ -412,6 +530,7 @@ struct MediaCleanerView: View {
     // MARK: - Selection Helpers
 
     private func toggleSelection(for id: String) {
+        HapticFeedback.selection()
         if selectedIds.contains(id) {
             selectedIds.remove(id)
         } else {
@@ -420,6 +539,7 @@ struct MediaCleanerView: View {
     }
 
     private func toggleSelectTopTen() {
+        HapticFeedback.selection()
         if !selectedIds.isEmpty {
             selectedIds.removeAll()
             return
@@ -429,17 +549,17 @@ struct MediaCleanerView: View {
         }
     }
 
-    private func selectAllDuplicateCopies(in groups: [DuplicateGroup]) {
-        for group in groups {
-            // Keep index 0 (oldest original) unselected; select only redundant copies.
-            for copy in group.items.dropFirst() {
+    private func selectAllDuplicateCopies(in groups: [[MediaAssetItem]]) {
+        HapticFeedback.selection()
+        for groupItems in groups {
+            for copy in groupItems.dropFirst() {
                 selectedIds.insert(copy.id)
             }
         }
     }
 }
 
-// MARK: - Row & Duplicate Group Views
+// MARK: - Row & Cluster Group Views
 
 private struct MediaAssetRow: View {
     let item: MediaAssetItem
@@ -508,11 +628,22 @@ private struct MediaAssetRow: View {
                                 .foregroundStyle(CyberTheme.cyberCyan)
                         }
 
-                        Text(typeLabel)
-                            .font(.caption)
-                            .monospacedDigit()
-                            .foregroundStyle(CyberTheme.textSecondary)
-                            .lineLimit(1)
+                        HStack(spacing: 6) {
+                            Text(typeLabel)
+                                .font(.caption)
+                                .monospacedDigit()
+                                .foregroundStyle(CyberTheme.textSecondary)
+                                .lineLimit(1)
+
+                            Spacer()
+
+                            Label(
+                                item.isLocallyAvailable ? "Lokal" : "iCloud",
+                                systemImage: item.isLocallyAvailable ? "internaldrive" : "icloud"
+                            )
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(item.isLocallyAvailable ? CyberTheme.acidMint : CyberTheme.textSecondary)
+                        }
 
                         GeometryReader { geo in
                             ZStack(alignment: .leading) {
@@ -548,32 +679,34 @@ private struct MediaAssetRow: View {
     }
 }
 
-private struct DuplicateGroupCard: View {
-    let group: DuplicateGroup
+private struct ClusterGroupCard: View {
+    let headerTitle: String
+    let savingsText: String
+    let secondaryTag: String
+    let items: [MediaAssetItem]
     @Binding var selectedIds: Set<String>
-    let scanner: PhotoScannerService
     let onPreview: (MediaAssetItem) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Text("\(group.items.count) salinan identik")
+                Text(headerTitle)
                     .font(.subheadline.weight(.bold))
                     .foregroundStyle(CyberTheme.textPrimary)
                 Spacer()
-                Text("Hemat \(ByteFormatter.string(from: group.reclaimableBytes))")
+                Text(savingsText)
                     .font(.caption.weight(.bold))
                     .monospacedDigit()
                     .foregroundStyle(CyberTheme.acidMint)
             }
 
-            ForEach(Array(group.items.enumerated()), id: \.element.id) { index, item in
+            ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
                 HStack(spacing: 10) {
                     Button {
                         onPreview(item)
                     } label: {
                         HStack(spacing: 10) {
-                            Text(index == 0 ? "ASLI" : "SALINAN")
+                            Text(index == 0 ? "ASLI" : secondaryTag)
                                 .font(.caption2.weight(.bold))
                                 .foregroundStyle(index == 0 ? CyberTheme.mintInk : CyberTheme.textSecondary)
                                 .padding(.horizontal, 7)
@@ -602,6 +735,7 @@ private struct DuplicateGroupCard: View {
                     .buttonStyle(.plain)
 
                     Button {
+                        HapticFeedback.selection()
                         if selectedIds.contains(item.id) {
                             selectedIds.remove(item.id)
                         } else {
@@ -624,4 +758,3 @@ private struct DuplicateGroupCard: View {
         )
     }
 }
-

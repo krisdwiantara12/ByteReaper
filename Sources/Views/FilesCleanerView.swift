@@ -2,7 +2,8 @@ import QuickLook
 import SwiftUI
 
 /// Scans user-selected Files / Downloads / On My iPhone / iCloud folders recursively,
-/// ranks files from largest to smallest, opens QuickLook previews, and deletes files directly.
+/// ranks files from largest to smallest, filters by file category, opens QuickLook previews,
+/// and deletes files directly with clear single-item or batch confirmation.
 struct FilesCleanerView: View {
     @ObservedObject var scanner: FileFolderScannerService
     @Binding var selectedFileIds: Set<String>
@@ -11,14 +12,22 @@ struct FilesCleanerView: View {
     @State private var showFolderPicker = false
     @State private var previewURL: URL?
     @State private var searchText = ""
+    @State private var activeCategory: FileCategoryFilter = .all
+    @State private var pendingSingleDelete: ScannedFileItem?
 
     private var filteredFiles: [ScannedFileItem] {
         guard case .loaded(let files) = scanner.phase else { return [] }
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if query.isEmpty { return files }
-        return files.filter {
-            $0.name.lowercased().contains(query) || $0.relativePath.lowercased().contains(query)
+
+        return files.filter { file in
+            guard activeCategory.matches(extension: file.fileExtension) else { return false }
+            if query.isEmpty { return true }
+            return file.name.lowercased().contains(query) || file.relativePath.lowercased().contains(query)
         }
+    }
+
+    private var totalFilteredBytes: Int64 {
+        filteredFiles.reduce(0) { $0 + $1.byteSize }
     }
 
     private var maxBytes: Int64 {
@@ -34,9 +43,7 @@ struct FilesCleanerView: View {
             }
 
             switch scanner.phase {
-            case .idle:
-                idleFolderCard
-            case .permissionDenied:
+            case .idle, .permissionDenied:
                 idleFolderCard
             case .scanning(_, _, let statusText):
                 scanningCard(statusText: statusText)
@@ -57,6 +64,24 @@ struct FilesCleanerView: View {
             }
         }
         .quickLookPreview($previewURL)
+        .confirmationDialog(
+            pendingSingleDelete.map { "Hapus permanen '\($0.name)' (\(ByteFormatter.string(from: $0.byteSize)))?" } ?? "",
+            isPresented: Binding(
+                get: { pendingSingleDelete != nil },
+                set: { if !$0 { pendingSingleDelete = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Hapus Permanen", role: .destructive) {
+                if let target = pendingSingleDelete {
+                    pendingSingleDelete = nil
+                    onSingleDelete(target)
+                }
+            }
+            Button("Batal", role: .cancel) {
+                pendingSingleDelete = nil
+            }
+        }
     }
 
     private var headerControls: some View {
@@ -82,6 +107,7 @@ struct FilesCleanerView: View {
                     let isActive = scanner.activeFolderName == bookmark.displayName
                     HStack(spacing: 4) {
                         Button {
+                            HapticFeedback.selection()
                             selectedFileIds.removeAll()
                             scanner.scanBookmark(bookmark)
                         } label: {
@@ -120,25 +146,84 @@ struct FilesCleanerView: View {
     @ViewBuilder
     private var loadedFileList: some View {
         VStack(spacing: 10) {
-            HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass")
-                    .foregroundStyle(CyberTheme.textSecondary)
-                TextField("Cari file atau path...", text: $searchText)
-                    .font(.subheadline)
-                    .foregroundStyle(CyberTheme.textPrimary)
-                    .autocorrectionDisabled()
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(FileCategoryFilter.allCases) { category in
+                        let isSelected = activeCategory == category
+                        Button {
+                            HapticFeedback.selection()
+                            activeCategory = category
+                        } label: {
+                            Text(category.rawValue)
+                                .font(.caption.weight(isSelected ? .bold : .medium))
+                                .foregroundStyle(isSelected ? CyberTheme.cyanInk : CyberTheme.textSecondary)
+                                .padding(.horizontal, 12)
+                                .frame(minHeight: 44)
+                                .background(
+                                    isSelected ? CyberTheme.cyberCyan : CyberTheme.elevatedSurface,
+                                    in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                )
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                        .strokeBorder(isSelected ? CyberTheme.cyberCyan : CyberTheme.hairlineBorder, lineWidth: 1)
+                                )
+                        }
+                    }
+                }
+                .padding(.horizontal, 16)
             }
-            .padding(.horizontal, 12)
-            .frame(minHeight: 44)
-            .background(CyberTheme.elevatedSurface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .strokeBorder(CyberTheme.hairlineBorder, lineWidth: 1)
-            )
+
+            HStack(spacing: 8) {
+                HStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundStyle(CyberTheme.textSecondary)
+                    TextField("Cari file atau path...", text: $searchText)
+                        .font(.subheadline)
+                        .foregroundStyle(CyberTheme.textPrimary)
+                        .autocorrectionDisabled()
+                }
+                .padding(.horizontal, 12)
+                .frame(minHeight: 44)
+                .background(CyberTheme.elevatedSurface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .strokeBorder(CyberTheme.hairlineBorder, lineWidth: 1)
+                )
+
+                Button {
+                    toggleSelectTopTen()
+                } label: {
+                    Text(selectedFileIds.isEmpty ? "Top 10" : "Reset")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(CyberTheme.cyberCyan)
+                        .padding(.horizontal, 12)
+                        .frame(minHeight: 44)
+                        .background(CyberTheme.elevatedSurface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .strokeBorder(CyberTheme.hairlineBorder, lineWidth: 1)
+                        )
+                }
+            }
+            .padding(.horizontal, 16)
+
+            HStack {
+                Text("\(filteredFiles.count) file · Total \(ByteFormatter.string(from: totalFilteredBytes))")
+                    .font(.caption.weight(.semibold))
+                    .monospacedDigit()
+                    .foregroundStyle(CyberTheme.textSecondary)
+                Spacer()
+                if let folderName = scanner.activeFolderName {
+                    Text(folderName)
+                        .font(.caption)
+                        .foregroundStyle(CyberTheme.cyberCyan)
+                        .lineLimit(1)
+                }
+            }
             .padding(.horizontal, 16)
 
             if filteredFiles.isEmpty {
-                emptyCard(title: "Tidak Ada File Cocok", detail: "Ubah kata kunci pencarian Anda.")
+                emptyCard(title: "Tidak Ada File Cocok", detail: "Ubah filter kategori atau kata kunci pencarian Anda.")
             } else {
                 LazyVStack(spacing: 8) {
                     ForEach(filteredFiles) { file in
@@ -148,13 +233,14 @@ struct FilesCleanerView: View {
                             isSelected: selectedFileIds.contains(file.id),
                             onPreview: { previewURL = file.url },
                             onToggleSelect: {
+                                HapticFeedback.selection()
                                 if selectedFileIds.contains(file.id) {
                                     selectedFileIds.remove(file.id)
                                 } else {
                                     selectedFileIds.insert(file.id)
                                 }
                             },
-                            onSwipeDelete: { onSingleDelete(file) }
+                            onRequestDelete: { pendingSingleDelete = file }
                         )
                     }
                 }
@@ -271,6 +357,17 @@ struct FilesCleanerView: View {
         )
         .padding(.horizontal, 16)
     }
+
+    private func toggleSelectTopTen() {
+        HapticFeedback.selection()
+        if !selectedFileIds.isEmpty {
+            selectedFileIds.removeAll()
+            return
+        }
+        for file in filteredFiles.prefix(10) {
+            selectedFileIds.insert(file.id)
+        }
+    }
 }
 
 private struct FileRowView: View {
@@ -279,7 +376,7 @@ private struct FileRowView: View {
     let isSelected: Bool
     let onPreview: () -> Void
     let onToggleSelect: () -> Void
-    let onSwipeDelete: () -> Void
+    let onRequestDelete: () -> Void
 
     private var proportion: Double {
         guard maxBytes > 0 else { return 0 }
@@ -287,19 +384,17 @@ private struct FileRowView: View {
     }
 
     private var iconName: String {
-        switch file.fileExtension {
-        case "mp4", "mov", "mkv", "avi": return "film"
-        case "jpg", "jpeg", "png", "heic", "webp": return "photo"
-        case "zip", "rar", "7z", "ipa": return "archivebox"
-        case "pdf", "txt", "md": return "doc.text"
-        default: return "doc"
-        }
+        if FileCategoryFilter.video.matches(extension: file.fileExtension) { return "film" }
+        if FileCategoryFilter.image.matches(extension: file.fileExtension) { return "photo" }
+        if FileCategoryFilter.archive.matches(extension: file.fileExtension) { return "archivebox" }
+        if FileCategoryFilter.document.matches(extension: file.fileExtension) { return "doc.text" }
+        return "doc"
     }
 
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 8) {
             Button(action: onPreview) {
-                HStack(spacing: 12) {
+                HStack(spacing: 10) {
                     Image(systemName: iconName)
                         .font(.title3)
                         .foregroundStyle(CyberTheme.cyberCyan)
@@ -337,11 +432,14 @@ private struct FileRowView: View {
                 }
             }
             .buttonStyle(.plain)
-            .contextMenu {
-                Button(role: .destructive, action: onSwipeDelete) {
-                    Label("Hapus File Ini", systemImage: "trash")
-                }
+
+            Button(action: onRequestDelete) {
+                Image(systemName: "trash")
+                    .font(.subheadline)
+                    .foregroundStyle(CyberTheme.crimsonText)
+                    .frame(width: 44, height: 44)
             }
+            .accessibilityLabel("Hapus \(file.name)")
 
             Button(action: onToggleSelect) {
                 Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
@@ -359,4 +457,3 @@ private struct FileRowView: View {
         )
     }
 }
-

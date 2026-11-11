@@ -3,6 +3,7 @@ import CryptoKit
 import Foundation
 import Photos
 import UIKit
+import Vision
 
 /// Pure grouping helpers for identifying candidate and SHA-256 verified duplicate media.
 enum DuplicateGrouper {
@@ -54,18 +55,105 @@ enum DuplicateGrouper {
     }
 }
 
-/// Scans the iOS Photo Library via PhotoKit, measures exact asset resource sizes,
-/// hashes candidate duplicates with SHA-256, and executes real batch deletion.
+/// Pure clustering helper that groups visually similar items into connected components.
+enum SimilarPhotoClusterer {
+    struct ClusterResult<Item: DuplicateGroupable> {
+        let id: String
+        let averageSimilarityPercent: Int
+        let items: [Item]
+    }
+
+    /// Builds clusters from a list sorted newest-first using a caller-provided pairwise similarity percentage (0..100).
+    /// Only compares items within `maxWindow` indices and `maxTimeGapSeconds` to stay O(N) on large libraries.
+    static func cluster<Item: DuplicateGroupable>(
+        items: [Item],
+        maxWindow: Int = 15,
+        maxTimeGapSeconds: TimeInterval = 86_400,
+        similarityPercent: (Int, Int) -> Int?
+    ) -> [ClusterResult<Item>] {
+        let n = items.count
+        guard n >= 2 else { return [] }
+
+        var parent = Array(0..<n)
+        var scoresByRoot: [Int: [Int]] = [:]
+
+        func find(_ x: Int) -> Int {
+            var cur = x
+            while parent[cur] != cur {
+                parent[cur] = parent[parent[cur]]
+                cur = parent[cur]
+            }
+            return cur
+        }
+
+        func union(_ a: Int, _ b: Int, score: Int) {
+            let ra = find(a)
+            let rb = find(b)
+            if ra != rb {
+                parent[rb] = ra
+                var merged = scoresByRoot[ra] ?? []
+                merged.append(contentsOf: scoresByRoot[rb] ?? [])
+                merged.append(score)
+                scoresByRoot[ra] = merged
+                scoresByRoot.removeValue(forKey: rb)
+            } else {
+                scoresByRoot[ra, default: []].append(score)
+            }
+        }
+
+        for i in 0..<n {
+            let upper = min(n - 1, i + maxWindow)
+            guard i + 1 <= upper else { continue }
+            for j in (i + 1)...upper {
+                if abs(items[i].creationDate.timeIntervalSince(items[j].creationDate)) > maxTimeGapSeconds {
+                    continue
+                }
+                if let score = similarityPercent(i, j) {
+                    union(i, j, score: score)
+                }
+            }
+        }
+
+        var buckets: [Int: [Item]] = [:]
+        for i in 0..<n {
+            buckets[find(i), default: []].append(items[i])
+        }
+
+        return buckets.compactMap { root, groupItems in
+            guard groupItems.count >= 2 else { return nil }
+            let sortedOldestFirst = groupItems.sorted { $0.creationDate < $1.creationDate }
+            let scores = scoresByRoot[root] ?? []
+            let avg = scores.isEmpty ? 85 : scores.reduce(0, +) / scores.count
+            return ClusterResult(
+                id: sortedOldestFirst.first?.id ?? UUID().uuidString,
+                averageSimilarityPercent: avg,
+                items: sortedOldestFirst
+            )
+        }
+        .sorted {
+            let reclaimA = $0.items.dropFirst().reduce(Int64(0)) { $0 + $1.byteSize }
+            let reclaimB = $1.items.dropFirst().reduce(Int64(0)) { $0 + $1.byteSize }
+            return reclaimA > reclaimB
+        }
+    }
+}
+
+/// Scans the iOS Photo Library via PhotoKit in two phases (fast videos first, then photos),
+/// detects local vs iCloud availability, verifies exact SHA-256 duplicates and Vision similar shots,
+/// and performs direct PhotoKit batch deletion.
 @MainActor
 final class PhotoScannerService: ObservableObject {
     @Published private(set) var authorizationStatus: PHAuthorizationStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
     @Published private(set) var phase: ScanPhase<[MediaAssetItem]> = .idle
+    @Published private(set) var backgroundPhotoScanStatus: String?
     @Published private(set) var duplicatePhase: ScanPhase<[DuplicateGroup]> = .idle
+    @Published private(set) var similarPhase: ScanPhase<[SimilarPhotoGroup]> = .idle
     @Published private(set) var sessionReclaimedBytes: Int64 = 0
 
     private let imageManager = PHCachingImageManager()
     private var activeScanTask: Task<Void, Never>?
     private var activeDuplicateTask: Task<Void, Never>?
+    private var activeSimilarTask: Task<Void, Never>?
 
     func refreshAuthorization() {
         authorizationStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
@@ -91,17 +179,25 @@ final class PhotoScannerService: ObservableObject {
         activeScanTask = nil
         activeDuplicateTask?.cancel()
         activeDuplicateTask = nil
+        activeSimilarTask?.cancel()
+        activeSimilarTask = nil
+        backgroundPhotoScanStatus = nil
+
         if case .scanning = phase {
             phase = .idle
         }
         if case .scanning = duplicatePhase {
             duplicatePhase = .idle
         }
+        if case .scanning = similarPhase {
+            similarPhase = .idle
+        }
     }
 
     func startScan() {
         activeScanTask?.cancel()
         activeDuplicateTask?.cancel()
+        activeSimilarTask?.cancel()
 
         let currentStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
         authorizationStatus = currentStatus
@@ -110,24 +206,65 @@ final class PhotoScannerService: ObservableObject {
             return
         }
 
-        phase = .scanning(processed: 0, total: 0, statusText: "Mengambil daftar foto dan video...")
+        phase = .scanning(processed: 0, total: 0, statusText: "Memindai video terbesar terlebih dahulu...")
+        backgroundPhotoScanStatus = nil
         duplicatePhase = .idle
+        similarPhase = .idle
 
         activeScanTask = Task { [weak self] in
             guard let self else { return }
-            let scanned = await Self.fetchAllAssetsSortedBySize { processed, total in
+
+            // Phase 1: Videos first so multi-GB MOV/4K files appear almost instantly.
+            let videos = await Self.fetchAssets(mediaType: .video) { processed, total in
                 await MainActor.run {
                     guard !Task.isCancelled else { return }
                     self.phase = .scanning(
                         processed: processed,
                         total: total,
-                        statusText: "Menghitung ukuran file (\(processed)/\(total))..."
+                        statusText: "Memindai video (\(processed)/\(total))..."
                     )
                 }
             }
 
             guard !Task.isCancelled else { return }
-            self.phase = .loaded(scanned)
+
+            if !videos.isEmpty {
+                self.phase = .loaded(videos.sorted { $0.byteSize > $1.byteSize })
+                self.backgroundPhotoScanStatus = "Memindai foto di latar belakang..."
+            } else {
+                self.phase = .scanning(processed: 0, total: 0, statusText: "Memindai galeri foto...")
+            }
+
+            // Phase 2: Photos in background, then merge and re-sort descending.
+            let photos = await Self.fetchAssets(mediaType: .image) { processed, total in
+                await MainActor.run {
+                    guard !Task.isCancelled else { return }
+                    if !videos.isEmpty {
+                        self.backgroundPhotoScanStatus = "Memindai foto (\(processed)/\(total))..."
+                    } else {
+                        self.phase = .scanning(
+                            processed: processed,
+                            total: total,
+                            statusText: "Menghitung ukuran foto (\(processed)/\(total))..."
+                        )
+                    }
+                }
+            }
+
+            guard !Task.isCancelled else { return }
+            self.backgroundPhotoScanStatus = nil
+
+            let merged: [MediaAssetItem]
+            if case .loaded(let currentItems) = self.phase, !videos.isEmpty {
+                // Preserve any deletions the user already executed during Phase 2.
+                let survivingVideoIds = Set(currentItems.filter(\.isVideo).map(\.id))
+                let survivingVideos = videos.filter { survivingVideoIds.contains($0.id) }
+                merged = (survivingVideos + photos).sorted { $0.byteSize > $1.byteSize }
+            } else {
+                merged = (videos + photos).sorted { $0.byteSize > $1.byteSize }
+            }
+
+            self.phase = .loaded(merged)
         }
     }
 
@@ -171,6 +308,68 @@ final class PhotoScannerService: ObservableObject {
         }
     }
 
+    /// Detects visually similar local photos offline using Apple Vision feature prints.
+    func findSimilarPhotosIfNeeded() {
+        guard case .loaded(let items) = phase else { return }
+        if case .loaded = similarPhase { return }
+        if case .scanning = similarPhase { return }
+
+        let localPhotos = items
+            .filter { !$0.isVideo && $0.isLocallyAvailable }
+            .sorted { $0.creationDate > $1.creationDate }
+            .prefix(800)
+
+        let candidates = Array(localPhotos)
+        guard candidates.count >= 2 else {
+            similarPhase = .loaded([])
+            return
+        }
+
+        similarPhase = .scanning(
+            processed: 0,
+            total: candidates.count,
+            statusText: "Menganalisis kemiripan visual (\(candidates.count) foto lokal)..."
+        )
+
+        activeSimilarTask = Task { [weak self] in
+            guard let self else { return }
+            var features: [VNFeaturePrintObservation?] = Array(repeating: nil, count: candidates.count)
+
+            for (idx, item) in candidates.enumerated() {
+                if Task.isCancelled { return }
+                if let thumb = await self.loadVisionThumbnail(for: item.asset),
+                   let cgImage = thumb.cgImage {
+                    features[idx] = await Task.detached(priority: .utility) {
+                        Self.extractFeaturePrint(from: cgImage)
+                    }.value
+                }
+                if idx % 15 == 0 || idx + 1 == candidates.count {
+                    self.similarPhase = .scanning(
+                        processed: idx + 1,
+                        total: candidates.count,
+                        statusText: "Menganalisis kemiripan foto (\(idx + 1)/\(candidates.count))..."
+                    )
+                }
+            }
+
+            guard !Task.isCancelled else { return }
+
+            let rawClusters = SimilarPhotoClusterer.cluster(items: candidates) { i, j in
+                guard let fpA = features[i], let fpB = features[j] else { return nil }
+                return Self.similarityPercentBetween(fpA, fpB)
+            }
+
+            let mapped = rawClusters.map { cluster in
+                SimilarPhotoGroup(
+                    id: cluster.id,
+                    averageSimilarityPercent: cluster.averageSimilarityPercent,
+                    items: cluster.items
+                )
+            }
+            self.similarPhase = .loaded(mapped)
+        }
+    }
+
     /// Executes native PhotoKit deletion (moves selected items to Recently Deleted on iOS).
     func deleteAssets(ids: Set<String>) async throws -> Int64 {
         guard case .loaded(let items) = phase else { return 0 }
@@ -202,6 +401,19 @@ final class PhotoScannerService: ObservableObject {
             duplicatePhase = .loaded(updatedGroups)
         }
 
+        if case .loaded(let existingSimilar) = similarPhase {
+            let updatedSimilar: [SimilarPhotoGroup] = existingSimilar.compactMap { group in
+                let kept = group.items.filter { !ids.contains($0.id) }
+                guard kept.count >= 2 else { return nil }
+                return SimilarPhotoGroup(
+                    id: group.id,
+                    averageSimilarityPercent: group.averageSimilarityPercent,
+                    items: kept
+                )
+            }
+            similarPhase = .loaded(updatedSimilar)
+        }
+
         return freedBytes
     }
 
@@ -212,7 +424,8 @@ final class PhotoScannerService: ObservableObject {
             targetSize: targetSize,
             contentMode: .aspectFill,
             deliveryMode: .opportunistic,
-            resizeMode: .fast
+            resizeMode: .fast,
+            allowNetwork: true
         )
     }
 
@@ -223,7 +436,32 @@ final class PhotoScannerService: ObservableObject {
             targetSize: PHImageManagerMaximumSize,
             contentMode: .aspectFit,
             deliveryMode: .highQualityFormat,
-            resizeMode: .none
+            resizeMode: .none,
+            allowNetwork: true
+        )
+    }
+
+    /// Loads an AVPlayerItem so large videos can be watched inside the preview sheet before deleting.
+    func loadPlayerItem(for asset: PHAsset) async -> AVPlayerItem? {
+        await withCheckedContinuation { continuation in
+            let options = PHVideoRequestOptions()
+            options.deliveryMode = .automatic
+            options.isNetworkAccessAllowed = true
+
+            imageManager.requestPlayerItem(forVideo: asset, options: options) { item, _ in
+                continuation.resume(returning: item)
+            }
+        }
+    }
+
+    private func loadVisionThumbnail(for asset: PHAsset) async -> UIImage? {
+        await requestImageOnce(
+            for: asset,
+            targetSize: CGSize(width: 256, height: 256),
+            contentMode: .aspectFit,
+            deliveryMode: .highQualityFormat,
+            resizeMode: .fast,
+            allowNetwork: false
         )
     }
 
@@ -232,14 +470,15 @@ final class PhotoScannerService: ObservableObject {
         targetSize: CGSize,
         contentMode: PHImageContentMode,
         deliveryMode: PHImageRequestOptionsDeliveryMode,
-        resizeMode: PHImageRequestOptionsResizeMode
+        resizeMode: PHImageRequestOptionsResizeMode,
+        allowNetwork: Bool
     ) async -> UIImage? {
         let gate = ResumeOnceGate()
         return await withCheckedContinuation { continuation in
             let options = PHImageRequestOptions()
             options.deliveryMode = deliveryMode
             options.resizeMode = resizeMode
-            options.isNetworkAccessAllowed = true
+            options.isNetworkAccessAllowed = allowNetwork
 
             imageManager.requestImage(
                 for: asset,
@@ -257,22 +496,10 @@ final class PhotoScannerService: ObservableObject {
         }
     }
 
-    /// Loads an AVPlayerItem so large videos can be watched inside the preview sheet before deleting.
-    func loadPlayerItem(for asset: PHAsset) async -> AVPlayerItem? {
-        await withCheckedContinuation { continuation in
-            let options = PHVideoRequestOptions()
-            options.deliveryMode = .automatic
-            options.isNetworkAccessAllowed = true
+    // MARK: - Private Background Enumeration & Vision Helpers
 
-            imageManager.requestPlayerItem(forVideo: asset, options: options) { item, _ in
-                continuation.resume(returning: item)
-            }
-        }
-    }
-
-    // MARK: - Private Background Enumeration
-
-    private static func fetchAllAssetsSortedBySize(
+    private static func fetchAssets(
+        mediaType: PHAssetMediaType,
         onProgress: @escaping @Sendable (Int, Int) async -> Void
     ) async -> [MediaAssetItem] {
         await Task.detached(priority: .userInitiated) {
@@ -280,12 +507,13 @@ final class PhotoScannerService: ObservableObject {
             fetchOptions.includeHiddenAssets = false
             fetchOptions.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
 
-            let result = PHAsset.fetchAssets(with: fetchOptions)
+            let result = PHAsset.fetchAssets(with: mediaType, options: fetchOptions)
             let total = result.count
             var collected: [MediaAssetItem] = []
             collected.reserveCapacity(total)
 
             let fileSizeSelector = NSSelectorFromString("fileSize")
+            let locallyAvailableSelector = NSSelectorFromString("locallyAvailable")
 
             for index in 0..<total {
                 if Task.isCancelled { return [] }
@@ -294,9 +522,17 @@ final class PhotoScannerService: ObservableObject {
 
                 var totalBytes: Int64 = 0
                 var primaryName = "Media"
+                var isLocal = true
+
                 for (rIdx, resource) in resources.enumerated() {
-                    if rIdx == 0 && !resource.originalFilename.isEmpty {
-                        primaryName = resource.originalFilename
+                    if rIdx == 0 {
+                        if !resource.originalFilename.isEmpty {
+                            primaryName = resource.originalFilename
+                        }
+                        if resource.responds(to: locallyAvailableSelector),
+                           let localNum = resource.value(forKey: "locallyAvailable") as? NSNumber {
+                            isLocal = localNum.boolValue
+                        }
                     }
                     if resource.responds(to: fileSizeSelector),
                        let number = resource.value(forKey: "fileSize") as? NSNumber {
@@ -316,7 +552,8 @@ final class PhotoScannerService: ObservableObject {
                     filename: primaryName,
                     isScreenshot: asset.mediaSubtypes.contains(.photoScreenshot),
                     isLivePhoto: asset.mediaSubtypes.contains(.photoLive),
-                    isBurst: asset.representsBurst
+                    isBurst: asset.representsBurst,
+                    isLocallyAvailable: isLocal
                 )
                 collected.append(item)
 
@@ -326,7 +563,7 @@ final class PhotoScannerService: ObservableObject {
                 }
             }
 
-            return collected.sorted { $0.byteSize > $1.byteSize }
+            return collected
         }.value
     }
 
@@ -353,6 +590,43 @@ final class PhotoScannerService: ObservableObject {
                     continuation.resume(returning: streamHasher.finalizeHex())
                 }
             )
+        }
+    }
+
+    nonisolated private static func extractFeaturePrint(from cgImage: CGImage) -> VNFeaturePrintObservation? {
+        let request = VNGenerateImageFeaturePrintRequest()
+        if #unavailable(iOS 17.0) {
+            request.revision = VNGenerateImageFeaturePrintRequestRevision1
+        }
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        do {
+            try handler.perform([request])
+            return request.results?.first as? VNFeaturePrintObservation
+        } catch {
+            return nil
+        }
+    }
+
+    nonisolated private static func similarityPercentBetween(
+        _ a: VNFeaturePrintObservation,
+        _ b: VNFeaturePrintObservation
+    ) -> Int? {
+        var distance: Float = 0
+        do {
+            try a.computeDistance(&distance, to: b)
+        } catch {
+            return nil
+        }
+
+        if #available(iOS 17.0, *) {
+            // Revision 2 uses unit-normalized vectors (distance range 0...2).
+            guard distance <= 0.52 else { return nil }
+            let cosine = max(0.0, min(1.0, 1.0 - (Double(distance) * Double(distance)) / 2.0))
+            return max(50, min(99, Int((cosine * 100.0).rounded())))
+        } else {
+            guard distance <= 8.5 else { return nil }
+            let normalized = max(0.0, min(1.0, 1.0 - Double(distance) / 20.0))
+            return max(50, min(99, Int((normalized * 100.0).rounded())))
         }
     }
 }

@@ -1,3 +1,4 @@
+import AVFoundation
 import XCTest
 @testable import ByteReaper
 
@@ -79,6 +80,51 @@ final class StorageLogicTests: XCTestCase {
         XCTAssertEqual(groups.count, 1)
         XCTAssertEqual(groups[0].items.map(\.id), ["1", "2"])
         XCTAssertEqual(groups[0].reclaimableBytes, 5_000_000)
+    }
+
+    func testSimilarPhotoClustererGroupsBurstAndRespectsTimeWindow() {
+        let baseDate = Date(timeIntervalSince1970: 1_700_000_000)
+
+        // Sorted newest-first as PhotoScannerService feeds it.
+        let burst3 = TestMediaItem(id: "b3", byteSize: 3_000_000, pixelWidth: 4032, pixelHeight: 3024, mediaTypeRaw: 1, creationDate: baseDate.addingTimeInterval(20))
+        let burst2 = TestMediaItem(id: "b2", byteSize: 2_800_000, pixelWidth: 4032, pixelHeight: 3024, mediaTypeRaw: 1, creationDate: baseDate.addingTimeInterval(10))
+        let burst1 = TestMediaItem(id: "b1", byteSize: 2_900_000, pixelWidth: 4032, pixelHeight: 3024, mediaTypeRaw: 1, creationDate: baseDate)
+        let oldShot = TestMediaItem(id: "old", byteSize: 4_000_000, pixelWidth: 4032, pixelHeight: 3024, mediaTypeRaw: 1, creationDate: baseDate.addingTimeInterval(-200_000))
+
+        let items = [burst3, burst2, burst1, oldShot]
+        let clusters = SimilarPhotoClusterer.cluster(items: items) { i, j in
+            let ids = Set([items[i].id, items[j].id])
+            if ids.isSubset(of: ["b1", "b2", "b3"]) { return 92 }
+            // Even if similarity returned non-nil, oldShot exceeds 24h window so it is skipped.
+            return 90
+        }
+
+        XCTAssertEqual(clusters.count, 1)
+        XCTAssertEqual(clusters[0].items.map(\.id), ["b1", "b2", "b3"])
+        XCTAssertEqual(clusters[0].averageSimilarityPercent, 92)
+    }
+
+    func testFileCategoryFiltersMatchExpectedExtensions() {
+        XCTAssertTrue(FileCategoryFilter.video.matches(extension: "MOV"))
+        XCTAssertTrue(FileCategoryFilter.image.matches(extension: "heic"))
+        XCTAssertTrue(FileCategoryFilter.archive.matches(extension: "ipa"))
+        XCTAssertTrue(FileCategoryFilter.document.matches(extension: "PDF"))
+        XCTAssertFalse(FileCategoryFilter.video.matches(extension: "pdf"))
+        XCTAssertTrue(FileCategoryFilter.all.matches(extension: "xyz"))
+    }
+
+    func testVideoCompressionPresetSelectionFallsBackCleanly() {
+        let hevcPicked = VideoCompressionService.preferredExportPreset(
+            compatiblePresets: [AVAssetExportPreset1920x1080, AVAssetExportPresetHEVC1920x1080],
+            choice: .hevc1080p
+        )
+        XCTAssertEqual(hevcPicked, AVAssetExportPresetHEVC1920x1080)
+
+        let fallback = VideoCompressionService.preferredExportPreset(
+            compatiblePresets: [AVAssetExportPresetMediumQuality],
+            choice: .mp41080p
+        )
+        XCTAssertEqual(fallback, AVAssetExportPresetMediumQuality)
     }
 
     func testTelemetryReadsNonNegativeStorageAndClearsTmpFile() throws {

@@ -11,6 +11,7 @@ final class FileFolderScannerService: ObservableObject {
 
     private let defaultsKey = "bytereaper.folderBookmarks.v1"
     private var activeSecurityToken: SecurityScopeToken?
+    private var activeFolderURL: URL?
     private var activeScanTask: Task<Void, Never>?
 
     init() {
@@ -77,9 +78,19 @@ final class FileFolderScannerService: ObservableObject {
         }
     }
 
+    func rescanActiveFolder() {
+        if let activeFolderURL {
+            scanFolder(url: activeFolderURL, displayName: activeFolderName ?? activeFolderURL.lastPathComponent)
+        } else if let name = activeFolderName,
+                  let bookmark = bookmarks.first(where: { $0.displayName == name }) {
+            scanBookmark(bookmark)
+        }
+    }
+
     func scanFolder(url: URL, displayName: String) {
         activeScanTask?.cancel()
         activeSecurityToken = SecurityScopeToken(url: url)
+        activeFolderURL = url
 
         activeFolderName = displayName.isEmpty ? url.lastPathComponent : displayName
         phase = .scanning(processed: 0, total: 0, statusText: "Memindai folder \(activeFolderName ?? "")...")

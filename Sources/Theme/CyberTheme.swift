@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// Color tokens and visual styling for ByteReaper's Dark OLED Cyberpunk iOS Glass interface.
 /// All text/background combinations are verified against WCAG AA (>= 4.5:1).
@@ -15,6 +16,25 @@ enum CyberTheme {
     static let crimsonText = Color(red: 1.000, green: 0.361, blue: 0.541)     // #FF5C8A (7.15:1 on black)
     static let acidMint = Color(red: 0.180, green: 0.902, blue: 0.651)        // #2EE6A6 (12.99:1 on black)
     static let mintInk = Color(red: 0.012, green: 0.094, blue: 0.071)         // #031812 (11.36:1 on mint)
+}
+
+/// Lightweight tactile feedback wrapper compatible with iOS 16.0+.
+@MainActor
+enum HapticFeedback {
+    static func selection() {
+        let generator = UIImpactFeedbackGenerator(style: .light)
+        generator.impactOccurred()
+    }
+
+    static func success() {
+        let generator = UINotificationFeedbackGenerator()
+        generator.notificationOccurred(.success)
+    }
+
+    static func warning() {
+        let generator = UINotificationFeedbackGenerator()
+        generator.notificationOccurred(.warning)
+    }
 }
 
 /// Formats byte sizes and durations with tabular monospaced precision for fast scanning.
@@ -87,4 +107,3 @@ extension View {
         modifier(CyberGlassSurface(cornerRadius: cornerRadius, accentGlow: accentGlow))
     }
 }
-
