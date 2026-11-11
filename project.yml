@@ -1,0 +1,44 @@
+name: ByteReaper
+options:
+  bundleIdPrefix: com.kris.storage
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+
+targets:
+  ByteReaper:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+      - path: Resources/Assets.xcassets
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.kris.storage.bytereaper
+        SWIFT_VERSION: "5.9"
+        TARGETED_DEVICE_FAMILY: "1"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: Resources/Info.plist
+        DEVELOPMENT_ASSET_PATHS: ""
+      configs:
+        Debug:
+          ENABLE_TESTABILITY: YES
+    scheme:
+      testTargets:
+        - ByteReaperTests
+
+  ByteReaperTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests/ByteReaperTests
+    dependencies:
+      - target: ByteReaper
+    settings:
+      base:
+        SWIFT_VERSION: "5.9"
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/ByteReaper.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/ByteReaper"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+
