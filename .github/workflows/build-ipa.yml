@@ -38,14 +38,19 @@ jobs:
 
       - name: Run unit tests
         run: |
+          set -o pipefail
           xcodebuild test \
             -project ByteReaper.xcodeproj \
             -scheme ByteReaper \
-            -destination "id=$SIM_ID" \
-            CODE_SIGNING_ALLOWED=NO
+            -destination "id=$SIM_ID" 2>&1 | tee build-test.log || {
+              echo "::error::xcodebuild test failed"
+              grep -nE "error:|fatal error:|failed" build-test.log | tail -n 40 || true
+              exit 1
+            }
 
       - name: Archive Release app for iphoneos
         run: |
+          set -o pipefail
           xcodebuild archive \
             -project ByteReaper.xcodeproj \
             -scheme ByteReaper \
@@ -54,7 +59,11 @@ jobs:
             -archivePath build/ByteReaper.xcarchive \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO
+            CODE_SIGNING_REQUIRED=NO 2>&1 | tee build-archive.log || {
+              echo "::error::xcodebuild archive failed"
+              grep -nE "error:|fatal error:" build-archive.log | tail -n 40 || true
+              exit 1
+            }
 
       - name: Package IPA and verify arm64 Mach-O binary
         run: |
@@ -71,4 +80,14 @@ jobs:
           name: ByteReaper-unsigned-ipa
           path: build/ByteReaper-unsigned.ipa
           if-no-files-found: error
+
+      - name: Upload failure logs if build fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            build-test.log
+            build-archive.log
+          if-no-files-found: ignore
 

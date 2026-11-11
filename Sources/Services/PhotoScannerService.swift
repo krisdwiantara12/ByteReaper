@@ -32,11 +32,11 @@ enum DuplicateGrouper {
 
     /// Groups items that share an identical SHA-256 digest, sorted by largest reclaimable savings first.
     static func buildGroups<Item: DuplicateGroupable>(
-        from hashedItems: [(item: Item, sha256: String)]
+        from hashedItems: [(Item, String)]
     ) -> [DuplicateGroupGeneric<Item>] {
         var byHash: [String: [Item]] = [:]
-        for entry in hashedItems {
-            byHash[entry.sha256, default: []].append(entry.item)
+        for (item, sha256) in hashedItems {
+            byHash[sha256, default: []].append(item)
         }
 
         return byHash.compactMap { hash, groupItems in

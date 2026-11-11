@@ -320,8 +320,7 @@ private struct FileRowView: View {
                         }
 
                         Text(file.relativePath)
-                            .font(.caption)
-                            .fontDesign(.monospaced)
+                            .font(.system(.caption, design: .monospaced))
                             .foregroundStyle(CyberTheme.textSecondary)
                             .lineLimit(1)
 

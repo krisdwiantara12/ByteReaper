@@ -4,3 +4,4 @@ build/
 DerivedData/
 *.ipa
 *.xcarchive
+*.log
