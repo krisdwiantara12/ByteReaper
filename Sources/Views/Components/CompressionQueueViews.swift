@@ -640,7 +640,7 @@ struct BatchPhotoConversionSheet: View {
 
     private func startConversion() {
         guard !isConverting else { return }
-        HapticFeedback.impact()
+        HapticFeedback.selection()
         isConverting = true
         completedCount = 0
         failedCount = 0
