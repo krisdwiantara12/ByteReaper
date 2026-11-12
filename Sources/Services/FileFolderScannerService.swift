@@ -1,18 +1,22 @@
+import CryptoKit
 import Foundation
 
 /// Recursively scans user-granted folders (Files, Downloads, On My iPhone, iCloud Drive)
-/// sorted from largest file to smallest, and performs direct file deletion.
+/// sorted from largest file to smallest, finds byte-identical duplicates via streaming SHA-256,
+/// and performs direct file deletion.
 @MainActor
 final class FileFolderScannerService: ObservableObject {
     @Published private(set) var bookmarks: [BookmarkedFolder] = []
     @Published private(set) var activeFolderName: String?
     @Published private(set) var phase: ScanPhase<[ScannedFileItem]> = .idle
+    @Published private(set) var duplicatePhase: ScanPhase<[FileDuplicateGroup]> = .idle
     @Published private(set) var sessionReclaimedBytes: Int64 = 0
 
     private let defaultsKey = "bytereaper.folderBookmarks.v1"
     private var activeSecurityToken: SecurityScopeToken?
     private var activeFolderURL: URL?
     private var activeScanTask: Task<Void, Never>?
+    private var activeDuplicateTask: Task<Void, Never>?
 
     init() {
         loadBookmarks()
@@ -73,8 +77,13 @@ final class FileFolderScannerService: ObservableObject {
     func cancelScan() {
         activeScanTask?.cancel()
         activeScanTask = nil
+        activeDuplicateTask?.cancel()
+        activeDuplicateTask = nil
         if case .scanning = phase {
             phase = .idle
+        }
+        if case .scanning = duplicatePhase {
+            duplicatePhase = .idle
         }
     }
 
@@ -89,11 +98,13 @@ final class FileFolderScannerService: ObservableObject {
 
     func scanFolder(url: URL, displayName: String) {
         activeScanTask?.cancel()
+        activeDuplicateTask?.cancel()
         activeSecurityToken = SecurityScopeToken(url: url)
         activeFolderURL = url
 
         activeFolderName = displayName.isEmpty ? url.lastPathComponent : displayName
         phase = .scanning(processed: 0, total: 0, statusText: "Memindai folder \(activeFolderName ?? "")...")
+        duplicatePhase = .idle
 
         activeScanTask = Task { [weak self] in
             guard let self else { return }
@@ -117,6 +128,45 @@ final class FileFolderScannerService: ObservableObject {
         }
     }
 
+    /// Computes streaming SHA-256 duplicates across scanned files having matching non-zero byte sizes.
+    func findDuplicatesIfNeeded() {
+        guard case .loaded(let items) = phase else { return }
+        if case .loaded = duplicatePhase { return }
+        if case .scanning = duplicatePhase { return }
+
+        let sizeBuckets = Dictionary(grouping: items.filter { $0.byteSize > 0 }, by: \.byteSize)
+            .values
+            .filter { $0.count >= 2 }
+        let candidateCount = sizeBuckets.reduce(0) { $0 + $1.count }
+
+        guard candidateCount >= 2 else {
+            duplicatePhase = .loaded([])
+            return
+        }
+
+        duplicatePhase = .scanning(
+            processed: 0,
+            total: candidateCount,
+            statusText: "Memeriksa SHA-256 \(candidateCount) kandidat duplikat..."
+        )
+
+        activeDuplicateTask = Task { [weak self] in
+            guard let self else { return }
+            let groups = await Self.findDuplicateGroups(in: items) { processed, total in
+                await MainActor.run {
+                    guard !Task.isCancelled else { return }
+                    self.duplicatePhase = .scanning(
+                        processed: processed,
+                        total: total,
+                        statusText: "Memeriksa file identik (\(processed)/\(total))..."
+                    )
+                }
+            }
+            guard !Task.isCancelled else { return }
+            self.duplicatePhase = .loaded(groups)
+        }
+    }
+
     /// Deletes selected files directly from disk and returns total freed bytes.
     func deleteFiles(ids: Set<String>) -> (freedBytes: Int64, failedCount: Int) {
         guard case .loaded(let currentItems) = phase else { return (0, 0) }
@@ -136,9 +186,89 @@ final class FileFolderScannerService: ObservableObject {
         }
 
         sessionReclaimedBytes += freed
+        if freed > 0 {
+            AllTimeReclaimedStore.add(freed)
+        }
+
         let remaining = currentItems.filter { !deletedIds.contains($0.id) }
         phase = .loaded(remaining)
+
+        if case .loaded(let groups) = duplicatePhase {
+            let updatedGroups: [FileDuplicateGroup] = groups.compactMap { group in
+                let kept = group.items.filter { !deletedIds.contains($0.id) }
+                guard kept.count >= 2 else { return nil }
+                return FileDuplicateGroup(
+                    id: group.id,
+                    sha256: group.sha256,
+                    byteSizeEach: group.byteSizeEach,
+                    items: kept
+                )
+            }
+            duplicatePhase = .loaded(updatedGroups)
+        }
+
         return (freed, failed)
+    }
+
+    /// Pure non-actor helper exposed as internal for direct unit testing in ByteReaperTests.
+    nonisolated static func findDuplicateGroups(
+        in items: [ScannedFileItem],
+        onProgress: (@Sendable (Int, Int) async -> Void)? = nil
+    ) async -> [FileDuplicateGroup] {
+        await Task.detached(priority: .utility) {
+            let buckets = Dictionary(grouping: items.filter { $0.byteSize > 0 }, by: \.byteSize)
+                .values
+                .filter { $0.count >= 2 }
+                .sorted { ($0.first?.byteSize ?? 0) > ($1.first?.byteSize ?? 0) }
+
+            let candidates = buckets.flatMap { $0 }
+            guard !candidates.isEmpty else { return [] }
+
+            var byHash: [String: [ScannedFileItem]] = [:]
+            for (index, item) in candidates.enumerated() {
+                if Task.isCancelled { return [] }
+                if let hash = streamingSHA256(for: item.url) {
+                    byHash[hash, default: []].append(item)
+                }
+                if let onProgress, (index % 5 == 0 || index + 1 == candidates.count) {
+                    await onProgress(index + 1, candidates.count)
+                    await Task.yield()
+                }
+            }
+
+            return byHash.compactMap { hash, groupItems in
+                guard groupItems.count >= 2 else { return nil }
+                let sortedOldestFirst = groupItems.sorted { $0.modifiedDate < $1.modifiedDate }
+                let sizeEach = sortedOldestFirst.first?.byteSize ?? 0
+                return FileDuplicateGroup(
+                    id: hash,
+                    sha256: hash,
+                    byteSizeEach: sizeEach,
+                    items: sortedOldestFirst
+                )
+            }
+            .sorted { $0.reclaimableBytes > $1.reclaimableBytes }
+        }.value
+    }
+
+    nonisolated private static func streamingSHA256(for url: URL) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+
+        var hasher = SHA256()
+        while true {
+            let shouldContinue = autoreleasepool { () -> Bool in
+                guard let chunk = try? handle.read(upToCount: 65_536), !chunk.isEmpty else {
+                    return false
+                }
+                hasher.update(data: chunk)
+                return true
+            }
+            if !shouldContinue { break }
+        }
+
+        let digest = hasher.finalize()
+        return digest.map { String(format: "%02x", $0) }.joined()
     }
 
     /// Pure non-actor helper exposed as internal for direct unit testing in ByteReaperTests.

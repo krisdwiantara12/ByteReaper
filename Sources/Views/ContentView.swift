@@ -24,21 +24,26 @@ private struct ScrollOffsetKey: PreferenceKey {
 }
 
 /// Root coordinator pinning StorageHUDCard at top, tracking scroll offset for compact mode,
-/// and switching the Floating Glass Dock (Glass Surface #2 of 2) into a contextual Batch Delete Bar.
+/// surfacing batch compression queue status, and switching the Floating Glass Dock (Glass Surface #2 of 2)
+/// into a contextual Batch Delete / Compress Bar.
 struct ContentView: View {
     @StateObject private var photoScanner = PhotoScannerService()
     @StateObject private var fileScanner = FileFolderScannerService()
+    @ObservedObject private var compressionQueue = CompressionQueueService.shared
 
     @State private var activeTab: CleanerTab = .media
     @State private var storageSnapshot: DeviceStorageSnapshot = StorageTelemetryService.readDeviceSnapshot()
     @State private var extraReclaimedBytes: Int64 = 0
+    @State private var allTimeReclaimedBytes: Int64 = AllTimeReclaimedStore.totalBytes()
     @State private var isCompactHUD: Bool = false
 
     @State private var selectedMediaIds: Set<String> = []
     @State private var selectedFileIds: Set<String> = []
 
     @State private var showBatchDeleteConfirm = false
+    @State private var showBatchCompressionSheet = false
     @State private var statusBanner: String?
+    @State private var statusBannerShowsOpenPhotos = false
     @State private var errorAlertMessage: String?
 
     private var totalReclaimedBytes: Int64 {
@@ -51,20 +56,28 @@ struct ContentView: View {
             if case .scanning = photoScanner.phase { return true }
             if case .scanning = photoScanner.duplicatePhase { return true }
             if case .scanning = photoScanner.similarPhase { return true }
+            if case .scanning = photoScanner.clutterPhase { return true }
             return photoScanner.backgroundPhotoScanStatus != nil
         case .files:
             if case .scanning = fileScanner.phase { return true }
+            if case .scanning = fileScanner.duplicatePhase { return true }
             return false
         case .guide:
             return false
         }
     }
 
+    private var selectedMediaItems: [MediaAssetItem] {
+        guard case .loaded(let items) = photoScanner.phase, !selectedMediaIds.isEmpty else { return [] }
+        return items.filter { selectedMediaIds.contains($0.id) }
+    }
+
+    private var allSelectedAreVideos: Bool {
+        activeTab == .media && !selectedMediaItems.isEmpty && selectedMediaItems.allSatisfy(\.isVideo)
+    }
+
     private var selectedMediaBytes: Int64 {
-        guard case .loaded(let items) = photoScanner.phase else { return 0 }
-        return items
-            .filter { selectedMediaIds.contains($0.id) }
-            .reduce(0) { $0 + $1.byteSize }
+        selectedMediaItems.reduce(0) { $0 + $1.byteSize }
     }
 
     private var selectedFileBytes: Int64 {
@@ -98,6 +111,7 @@ struct ContentView: View {
                 StorageHUDCard(
                     snapshot: storageSnapshot,
                     reclaimedBytes: totalReclaimedBytes,
+                    allTimeReclaimedBytes: allTimeReclaimedBytes,
                     isScanning: isScanningActive,
                     isCompact: isCompactHUD,
                     onRefresh: handleHUDAction
@@ -121,8 +135,20 @@ struct ContentView: View {
                                     .font(.caption.weight(.medium))
                                     .foregroundStyle(CyberTheme.textPrimary)
                                 Spacer()
+                                if statusBannerShowsOpenPhotos {
+                                    Button("Buka App Foto") {
+                                        if let url = URL(string: "photos-redirect://") {
+                                            UIApplication.shared.open(url)
+                                        }
+                                    }
+                                    .font(.caption.weight(.bold))
+                                    .foregroundStyle(CyberTheme.cyberCyan)
+                                    .padding(.horizontal, 8)
+                                    .frame(minHeight: 32)
+                                }
                                 Button {
                                     self.statusBanner = nil
+                                    self.statusBannerShowsOpenPhotos = false
                                 } label: {
                                     Image(systemName: "xmark")
                                         .font(.caption)
@@ -140,6 +166,16 @@ struct ContentView: View {
                             .padding(.horizontal, 16)
                         }
 
+                        if !compressionQueue.jobs.isEmpty && activeTab == .media {
+                            CompressionQueueBannerCard(
+                                queue: compressionQueue,
+                                onResumeForeground: { startQueuedCompression() },
+                                onDeleteCompletedOriginals: {
+                                    Task { await deleteQueueCompletedOriginals() }
+                                }
+                            )
+                        }
+
                         switch activeTab {
                         case .media:
                             MediaCleanerView(
@@ -150,7 +186,8 @@ struct ContentView: View {
                                 },
                                 onVideoCompressed: {
                                     storageSnapshot = StorageTelemetryService.readDeviceSnapshot()
-                                    statusBanner = "Salinan video terkompresi berhasil disimpan ke Galeri."
+                                    statusBannerShowsOpenPhotos = false
+                                    statusBanner = "Salinan hemat berhasil disimpan ke Galeri. Anda dapat menghapus file aslinya."
                                 }
                             )
                         case .files:
@@ -162,13 +199,21 @@ struct ContentView: View {
                                 }
                             )
                         case .guide:
-                            SandboxGuideView { freed in
-                                extraReclaimedBytes += freed
-                                storageSnapshot = StorageTelemetryService.readDeviceSnapshot()
-                                if freed > 0 {
-                                    HapticFeedback.success()
+                            SandboxGuideView(
+                                allTimeReclaimedBytes: allTimeReclaimedBytes,
+                                onSelfCacheCleaned: { freed in
+                                    extraReclaimedBytes += freed
+                                    if freed > 0 {
+                                        AllTimeReclaimedStore.add(freed)
+                                        allTimeReclaimedBytes = AllTimeReclaimedStore.totalBytes()
+                                        HapticFeedback.success()
+                                    }
+                                    storageSnapshot = StorageTelemetryService.readDeviceSnapshot()
+                                },
+                                onAllTimeStatsReset: {
+                                    allTimeReclaimedBytes = 0
                                 }
-                            }
+                            )
                         }
                     }
                 }
@@ -188,6 +233,20 @@ struct ContentView: View {
                 .padding(.horizontal, 16)
                 .padding(.bottom, 10)
         }
+        .sheet(isPresented: $showBatchCompressionSheet) {
+            BatchCompressionSheet(
+                videos: selectedMediaItems,
+                queue: compressionQueue,
+                onStartForeground: {
+                    selectedMediaIds.removeAll()
+                    startQueuedCompression()
+                },
+                onScheduledBackground: {
+                    selectedMediaIds.removeAll()
+                    HapticFeedback.success()
+                }
+            )
+        }
         .confirmationDialog(
             activeTab == .media
                 ? "Pindahkan \(activeSelectionCount) media (\(ByteFormatter.string(from: activeSelectionBytes))) ke album Baru Dihapus?"
@@ -205,7 +264,7 @@ struct ContentView: View {
             }
             Button("Batal", role: .cancel) {}
         }
-        .alert("Gagal Menghapus", isPresented: Binding(
+        .alert("Gagal Memproses", isPresented: Binding(
             get: { errorAlertMessage != nil },
             set: { if !$0 { errorAlertMessage = nil } }
         )) {
@@ -220,9 +279,9 @@ struct ContentView: View {
     private var floatingGlassDock: some View {
         Group {
             if activeSelectionCount > 0 {
-                HStack(spacing: 12) {
+                HStack(spacing: 10) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("\(activeSelectionCount) item terpilih")
+                        Text("\(activeSelectionCount) terpilih")
                             .font(.subheadline.weight(.bold))
                             .foregroundStyle(CyberTheme.textPrimary)
                         Text(ByteFormatter.string(from: activeSelectionBytes))
@@ -233,14 +292,37 @@ struct ContentView: View {
 
                     Spacer()
 
-                    Button {
-                        clearCurrentSelection()
-                    } label: {
-                        Text("Batal")
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(CyberTheme.textSecondary)
-                            .padding(.horizontal, 12)
-                            .frame(minHeight: 44)
+                    if allSelectedAreVideos {
+                        Button {
+                            clearCurrentSelection()
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(CyberTheme.textSecondary)
+                                .frame(width: 44, height: 44)
+                        }
+                        .accessibilityLabel("Batalkan pilihan")
+
+                        Button {
+                            showBatchCompressionSheet = true
+                        } label: {
+                            Label("Kompres", systemImage: "arrow.down.right.and.arrow.up.left")
+                                .font(.subheadline.weight(.bold))
+                                .foregroundStyle(CyberTheme.cyanInk)
+                                .padding(.horizontal, 12)
+                                .frame(minHeight: 44)
+                                .background(CyberTheme.cyberCyan, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        }
+                    } else {
+                        Button {
+                            clearCurrentSelection()
+                        } label: {
+                            Text("Batal")
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(CyberTheme.textSecondary)
+                                .padding(.horizontal, 12)
+                                .frame(minHeight: 44)
+                        }
                     }
 
                     Button {
@@ -249,7 +331,7 @@ struct ContentView: View {
                         Label("Hapus", systemImage: "trash")
                             .font(.subheadline.weight(.bold))
                             .foregroundStyle(Color.white)
-                            .padding(.horizontal, 16)
+                            .padding(.horizontal, 14)
                             .frame(minHeight: 44)
                             .background(CyberTheme.crimsonButtonFill, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
                     }
@@ -320,13 +402,47 @@ struct ContentView: View {
         }
     }
 
+    private func startQueuedCompression() {
+        compressionQueue.startForegroundQueue { deletedIds, netSavedBytes in
+            let idSet = Set(deletedIds)
+            photoScanner.recordExternalDeletion(ids: idSet, reclaimedBytes: netSavedBytes)
+            storageSnapshot = StorageTelemetryService.readDeviceSnapshot()
+            allTimeReclaimedBytes = AllTimeReclaimedStore.totalBytes()
+            if netSavedBytes > 0 {
+                HapticFeedback.success()
+                statusBannerShowsOpenPhotos = true
+                statusBanner = "\(ByteFormatter.string(from: netSavedBytes)) dihemat (asli dipindah ke Baru Dihapus)."
+            }
+        }
+    }
+
+    private func deleteQueueCompletedOriginals() async {
+        let outcome = await compressionQueue.deleteCompletedOriginals()
+        if let err = outcome.error {
+            HapticFeedback.warning()
+            errorAlertMessage = err
+            return
+        }
+        let idSet = Set(outcome.deletedIds)
+        photoScanner.recordExternalDeletion(ids: idSet, reclaimedBytes: outcome.netSavedBytes)
+        storageSnapshot = StorageTelemetryService.readDeviceSnapshot()
+        allTimeReclaimedBytes = AllTimeReclaimedStore.totalBytes()
+        if outcome.netSavedBytes > 0 {
+            HapticFeedback.success()
+            statusBannerShowsOpenPhotos = true
+            statusBanner = "\(ByteFormatter.string(from: outcome.netSavedBytes)) dihemat (asli dipindah ke Baru Dihapus)."
+        }
+    }
+
     private func executeMediaDeletion(ids: Set<String>) async {
         do {
             let freed = try await photoScanner.deleteAssets(ids: ids)
             selectedMediaIds.subtract(ids)
             storageSnapshot = StorageTelemetryService.readDeviceSnapshot()
+            allTimeReclaimedBytes = AllTimeReclaimedStore.totalBytes()
             if freed > 0 {
                 HapticFeedback.success()
+                statusBannerShowsOpenPhotos = true
                 statusBanner = "\(ByteFormatter.string(from: freed)) dipindahkan ke Baru Dihapus (Foto)."
             }
         } catch {
@@ -339,8 +455,10 @@ struct ContentView: View {
         let outcome = fileScanner.deleteFiles(ids: ids)
         selectedFileIds.subtract(ids)
         storageSnapshot = StorageTelemetryService.readDeviceSnapshot()
+        allTimeReclaimedBytes = AllTimeReclaimedStore.totalBytes()
         if outcome.freedBytes > 0 {
             HapticFeedback.success()
+            statusBannerShowsOpenPhotos = false
             statusBanner = "Berhasil menghapus permanen \(ByteFormatter.string(from: outcome.freedBytes))."
         }
         if outcome.failedCount > 0 {

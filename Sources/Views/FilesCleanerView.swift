@@ -2,8 +2,8 @@ import QuickLook
 import SwiftUI
 
 /// Scans user-selected Files / Downloads / On My iPhone / iCloud folders recursively,
-/// ranks files from largest to smallest, filters by file category, opens QuickLook previews,
-/// and deletes files directly with clear single-item or batch confirmation.
+/// ranks files by size or age, filters by category/0 KB/>30 Days, detects SHA-256 duplicates,
+/// opens QuickLook previews, and deletes files directly.
 struct FilesCleanerView: View {
     @ObservedObject var scanner: FileFolderScannerService
     @Binding var selectedFileIds: Set<String>
@@ -13,16 +13,25 @@ struct FilesCleanerView: View {
     @State private var previewURL: URL?
     @State private var searchText = ""
     @State private var activeCategory: FileCategoryFilter = .all
+    @State private var sortOrder: FileSortOrder = .largestFirst
     @State private var pendingSingleDelete: ScannedFileItem?
 
     private var filteredFiles: [ScannedFileItem] {
         guard case .loaded(let files) = scanner.phase else { return [] }
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let now = Date()
 
-        return files.filter { file in
-            guard activeCategory.matches(extension: file.fileExtension) else { return false }
+        let matched = files.filter { file in
+            guard activeCategory.matches(item: file, referenceDate: now) else { return false }
             if query.isEmpty { return true }
             return file.name.lowercased().contains(query) || file.relativePath.lowercased().contains(query)
+        }
+
+        switch sortOrder {
+        case .largestFirst:
+            return matched.sorted { $0.byteSize > $1.byteSize }
+        case .oldestFirst:
+            return matched.sorted { $0.modifiedDate < $1.modifiedDate }
         }
     }
 
@@ -31,7 +40,7 @@ struct FilesCleanerView: View {
     }
 
     private var maxBytes: Int64 {
-        filteredFiles.first?.byteSize ?? 1
+        filteredFiles.map(\.byteSize).max() ?? 1
     }
 
     var body: some View {
@@ -80,6 +89,11 @@ struct FilesCleanerView: View {
             }
             Button("Batal", role: .cancel) {
                 pendingSingleDelete = nil
+            }
+        }
+        .onChange(of: activeCategory) { newValue in
+            if newValue == .duplicates {
+                scanner.findDuplicatesIfNeeded()
             }
         }
     }
@@ -173,6 +187,16 @@ struct FilesCleanerView: View {
                 .padding(.horizontal, 16)
             }
 
+            if activeCategory == .duplicates {
+                fileDuplicatesSection
+            } else {
+                standardFileList
+            }
+        }
+    }
+
+    private var standardFileList: some View {
+        VStack(spacing: 10) {
             HStack(spacing: 8) {
                 HStack(spacing: 8) {
                     Image(systemName: "magnifyingglass")
@@ -189,6 +213,25 @@ struct FilesCleanerView: View {
                     RoundedRectangle(cornerRadius: 12, style: .continuous)
                         .strokeBorder(CyberTheme.hairlineBorder, lineWidth: 1)
                 )
+
+                Button {
+                    HapticFeedback.selection()
+                    sortOrder = sortOrder == .largestFirst ? .oldestFirst : .largestFirst
+                } label: {
+                    Image(systemName: "arrow.up.arrow.down")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(sortOrder == .oldestFirst ? CyberTheme.cyanInk : CyberTheme.textSecondary)
+                        .frame(width: 44, height: 44)
+                        .background(
+                            sortOrder == .oldestFirst ? CyberTheme.cyberCyan : CyberTheme.elevatedSurface,
+                            in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .strokeBorder(sortOrder == .oldestFirst ? CyberTheme.cyberCyan : CyberTheme.hairlineBorder, lineWidth: 1)
+                        )
+                }
+                .accessibilityLabel("Urutkan: \(sortOrder.rawValue)")
 
                 Button {
                     toggleSelectTopTen()
@@ -208,7 +251,7 @@ struct FilesCleanerView: View {
             .padding(.horizontal, 16)
 
             HStack {
-                Text("\(filteredFiles.count) file · Total \(ByteFormatter.string(from: totalFilteredBytes))")
+                Text("\(filteredFiles.count) file (\(sortOrder.rawValue)) · Total \(ByteFormatter.string(from: totalFilteredBytes))")
                     .font(.caption.weight(.semibold))
                     .monospacedDigit()
                     .foregroundStyle(CyberTheme.textSecondary)
@@ -250,6 +293,69 @@ struct FilesCleanerView: View {
         }
     }
 
+    @ViewBuilder
+    private var fileDuplicatesSection: some View {
+        switch scanner.duplicatePhase {
+        case .idle:
+            scanningCard(statusText: "Menyiapkan pemeriksaan SHA-256...")
+                .onAppear { scanner.findDuplicatesIfNeeded() }
+        case .scanning(_, _, let statusText):
+            scanningCard(statusText: statusText)
+        case .error(let msg):
+            errorCard(message: msg)
+        case .permissionDenied:
+            errorCard(message: "Izin folder diperlukan.")
+        case .loaded(let groups):
+            if groups.isEmpty {
+                emptyCard(
+                    title: "Tidak Ada File Duplikat",
+                    detail: "Semua file dengan ukuran sama di folder ini memiliki isi SHA-256 yang unik."
+                )
+            } else {
+                VStack(spacing: 10) {
+                    HStack {
+                        Text("\(groups.count) grup file duplikat")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(CyberTheme.textSecondary)
+                        Spacer()
+                        Button {
+                            HapticFeedback.selection()
+                            for group in groups {
+                                for copy in group.items.dropFirst() {
+                                    selectedFileIds.insert(copy.id)
+                                }
+                            }
+                        } label: {
+                            Text("Pilih Semua Duplikat")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(CyberTheme.cyberCyan)
+                                .padding(.horizontal, 12)
+                                .frame(minHeight: 44)
+                                .background(CyberTheme.elevatedSurface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                        .strokeBorder(CyberTheme.hairlineBorder, lineWidth: 1)
+                                )
+                        }
+                    }
+                    .padding(.horizontal, 16)
+
+                    LazyVStack(spacing: 12) {
+                        ForEach(groups) { group in
+                            FileDuplicateGroupCard(
+                                group: group,
+                                selectedFileIds: $selectedFileIds,
+                                onPreview: { previewURL = $0.url }
+                            )
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 110)
+                }
+            }
+        }
+    }
+
     private var idleFolderCard: some View {
         VStack(spacing: 12) {
             Image(systemName: "externaldrive.badge.questionmark")
@@ -258,7 +364,7 @@ struct FilesCleanerView: View {
             Text("Scan Folder di Aplikasi Files")
                 .font(.headline)
                 .foregroundStyle(CyberTheme.textPrimary)
-            Text("Pilih folder Downloads, On My iPhone, atau folder ekspor app lain lewat pemilih Files di atas untuk melihat file terbesar dan menghapusnya langsung.")
+            Text("Pilih folder Downloads, On My iPhone, atau folder ekspor app lain lewat pemilih Files di atas untuk melihat file terbesar, file lama, file 0 KB, serta file duplikat.")
                 .font(.subheadline)
                 .foregroundStyle(CyberTheme.textSecondary)
                 .multilineTextAlignment(.center)
@@ -370,6 +476,84 @@ struct FilesCleanerView: View {
     }
 }
 
+private struct FileDuplicateGroupCard: View {
+    let group: FileDuplicateGroup
+    @Binding var selectedFileIds: Set<String>
+    let onPreview: (ScannedFileItem) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("\(group.items.count) file identik")
+                    .font(.subheadline.weight(.bold))
+                    .foregroundStyle(CyberTheme.textPrimary)
+                Spacer()
+                Text("Hemat \(ByteFormatter.string(from: group.reclaimableBytes))")
+                    .font(.caption.weight(.bold))
+                    .monospacedDigit()
+                    .foregroundStyle(CyberTheme.acidMint)
+            }
+
+            ForEach(Array(group.items.enumerated()), id: \.element.id) { index, file in
+                HStack(spacing: 10) {
+                    Button {
+                        onPreview(file)
+                    } label: {
+                        HStack(spacing: 10) {
+                            Text(index == 0 ? "ASLI" : "DUPLIKAT")
+                                .font(.caption2.weight(.bold))
+                                .foregroundStyle(index == 0 ? CyberTheme.mintInk : CyberTheme.textSecondary)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 3)
+                                .background(
+                                    index == 0 ? CyberTheme.acidMint : CyberTheme.oledBlack,
+                                    in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                )
+
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(file.name)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(CyberTheme.textPrimary)
+                                    .lineLimit(1)
+                                Text(file.relativePath)
+                                    .font(.system(.caption2, design: .monospaced))
+                                    .foregroundStyle(CyberTheme.textSecondary)
+                                    .lineLimit(1)
+                            }
+                            Spacer()
+                            Text(ByteFormatter.string(from: file.byteSize))
+                                .font(.caption.weight(.semibold))
+                                .monospacedDigit()
+                                .foregroundStyle(CyberTheme.cyberCyan)
+                        }
+                    }
+                    .buttonStyle(.plain)
+
+                    Button {
+                        HapticFeedback.selection()
+                        if selectedFileIds.contains(file.id) {
+                            selectedFileIds.remove(file.id)
+                        } else {
+                            selectedFileIds.insert(file.id)
+                        }
+                    } label: {
+                        Image(systemName: selectedFileIds.contains(file.id) ? "checkmark.circle.fill" : "circle")
+                            .font(.title3)
+                            .foregroundStyle(selectedFileIds.contains(file.id) ? CyberTheme.cyberCyan : CyberTheme.textSecondary)
+                            .frame(width: 44, height: 44)
+                    }
+                }
+            }
+        }
+        .padding(12)
+        .background(CyberTheme.elevatedSurface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(CyberTheme.hairlineBorder, lineWidth: 1)
+        )
+    }
+}
+
 private struct FileRowView: View {
     let file: ScannedFileItem
     let maxBytes: Int64
@@ -414,10 +598,16 @@ private struct FileRowView: View {
                                 .foregroundStyle(CyberTheme.cyberCyan)
                         }
 
-                        Text(file.relativePath)
-                            .font(.system(.caption, design: .monospaced))
-                            .foregroundStyle(CyberTheme.textSecondary)
-                            .lineLimit(1)
+                        HStack {
+                            Text(file.relativePath)
+                                .font(.system(.caption, design: .monospaced))
+                                .foregroundStyle(CyberTheme.textSecondary)
+                                .lineLimit(1)
+                            Spacer()
+                            Text(file.modifiedDate.formatted(date: .abbreviated, time: .omitted))
+                                .font(.caption2)
+                                .foregroundStyle(CyberTheme.textSecondary)
+                        }
 
                         GeometryReader { geo in
                             ZStack(alignment: .leading) {

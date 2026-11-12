@@ -138,22 +138,87 @@ enum SimilarPhotoClusterer {
     }
 }
 
+/// Fast CPU Laplacian variance detector to flag out-of-focus blurry photos offline with minimal battery impact.
+enum LaplacianBlurDetector {
+    static let blurVarianceThreshold: Double = 130.0
+
+    /// Computes variance of the 4-neighbor discrete Laplacian over an 8-bit grayscale buffer.
+    static func computeVariance(pixels: [UInt8], width: Int, height: Int) -> Double {
+        guard width >= 3, height >= 3, pixels.count >= width * height else { return 0 }
+
+        var sum: Double = 0
+        var sumSq: Double = 0
+        var count = 0
+
+        for y in 1..<(height - 1) {
+            let row = y * width
+            for x in 1..<(width - 1) {
+                let idx = row + x
+                let center = Int(pixels[idx])
+                let laplacian = 4 * center
+                    - Int(pixels[idx - 1])
+                    - Int(pixels[idx + 1])
+                    - Int(pixels[idx - width])
+                    - Int(pixels[idx + width])
+                let val = Double(laplacian)
+                sum += val
+                sumSq += val * val
+                count += 1
+            }
+        }
+
+        guard count > 0 else { return 0 }
+        let mean = sum / Double(count)
+        return max(0, (sumSq / Double(count)) - (mean * mean))
+    }
+
+    nonisolated static func variance(of cgImage: CGImage, sampleDimension: Int = 96) -> Double? {
+        let width = sampleDimension
+        let height = sampleDimension
+        var buffer = [UInt8](repeating: 0, count: width * height)
+
+        let drawn = buffer.withUnsafeMutableBytes { rawPtr -> Bool in
+            guard let baseAddress = rawPtr.baseAddress,
+                  let context = CGContext(
+                      data: baseAddress,
+                      width: width,
+                      height: height,
+                      bitsPerComponent: 8,
+                      bytesPerRow: width,
+                      space: CGColorSpaceCreateDeviceGray(),
+                      bitmapInfo: CGImageAlphaInfo.none.rawValue
+                  ) else {
+                return false
+            }
+            context.interpolationQuality = .low
+            context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
+        }
+
+        guard drawn else { return nil }
+        return computeVariance(pixels: buffer, width: width, height: height)
+    }
+}
+
 /// Scans the iOS Photo Library via PhotoKit in two phases (fast videos first, then photos),
-/// detects local vs iCloud availability, verifies exact SHA-256 duplicates and Vision similar shots,
-/// and performs direct PhotoKit batch deletion.
+/// tags screen recordings, computes album filters, verifies exact SHA-256 duplicates, Vision similar shots,
+/// offline blur/document clutter, and performs direct PhotoKit batch deletion.
 @MainActor
 final class PhotoScannerService: ObservableObject {
     @Published private(set) var authorizationStatus: PHAuthorizationStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
     @Published private(set) var phase: ScanPhase<[MediaAssetItem]> = .idle
     @Published private(set) var backgroundPhotoScanStatus: String?
+    @Published private(set) var availableAlbums: [MediaAlbumFilter] = []
     @Published private(set) var duplicatePhase: ScanPhase<[DuplicateGroup]> = .idle
     @Published private(set) var similarPhase: ScanPhase<[SimilarPhotoGroup]> = .idle
+    @Published private(set) var clutterPhase: ScanPhase<[ClutterMediaItem]> = .idle
     @Published private(set) var sessionReclaimedBytes: Int64 = 0
 
     private let imageManager = PHCachingImageManager()
     private var activeScanTask: Task<Void, Never>?
     private var activeDuplicateTask: Task<Void, Never>?
     private var activeSimilarTask: Task<Void, Never>?
+    private var activeClutterTask: Task<Void, Never>?
 
     func refreshAuthorization() {
         authorizationStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
@@ -181,6 +246,8 @@ final class PhotoScannerService: ObservableObject {
         activeDuplicateTask = nil
         activeSimilarTask?.cancel()
         activeSimilarTask = nil
+        activeClutterTask?.cancel()
+        activeClutterTask = nil
         backgroundPhotoScanStatus = nil
 
         if case .scanning = phase {
@@ -192,12 +259,16 @@ final class PhotoScannerService: ObservableObject {
         if case .scanning = similarPhase {
             similarPhase = .idle
         }
+        if case .scanning = clutterPhase {
+            clutterPhase = .idle
+        }
     }
 
     func startScan() {
         activeScanTask?.cancel()
         activeDuplicateTask?.cancel()
         activeSimilarTask?.cancel()
+        activeClutterTask?.cancel()
 
         let currentStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
         authorizationStatus = currentStatus
@@ -208,14 +279,21 @@ final class PhotoScannerService: ObservableObject {
 
         phase = .scanning(processed: 0, total: 0, statusText: "Memindai video terbesar terlebih dahulu...")
         backgroundPhotoScanStatus = nil
+        availableAlbums = []
         duplicatePhase = .idle
         similarPhase = .idle
+        clutterPhase = .idle
 
         activeScanTask = Task { [weak self] in
             guard let self else { return }
 
+            let screenRecordingIds = await Self.fetchScreenRecordingIdentifiers()
+
             // Phase 1: Videos first so multi-GB MOV/4K files appear almost instantly.
-            let videos = await Self.fetchAssets(mediaType: .video) { processed, total in
+            let videos = await Self.fetchAssets(
+                mediaType: .video,
+                screenRecordingIds: screenRecordingIds
+            ) { processed, total in
                 await MainActor.run {
                     guard !Task.isCancelled else { return }
                     self.phase = .scanning(
@@ -236,7 +314,10 @@ final class PhotoScannerService: ObservableObject {
             }
 
             // Phase 2: Photos in background, then merge and re-sort descending.
-            let photos = await Self.fetchAssets(mediaType: .image) { processed, total in
+            let photos = await Self.fetchAssets(
+                mediaType: .image,
+                screenRecordingIds: []
+            ) { processed, total in
                 await MainActor.run {
                     guard !Task.isCancelled else { return }
                     if !videos.isEmpty {
@@ -256,7 +337,6 @@ final class PhotoScannerService: ObservableObject {
 
             let merged: [MediaAssetItem]
             if case .loaded(let currentItems) = self.phase, !videos.isEmpty {
-                // Preserve any deletions the user already executed during Phase 2.
                 let survivingVideoIds = Set(currentItems.filter(\.isVideo).map(\.id))
                 let survivingVideos = videos.filter { survivingVideoIds.contains($0.id) }
                 merged = (survivingVideos + photos).sorted { $0.byteSize > $1.byteSize }
@@ -265,6 +345,7 @@ final class PhotoScannerService: ObservableObject {
             }
 
             self.phase = .loaded(merged)
+            self.availableAlbums = await Self.fetchUserAlbums()
         }
     }
 
@@ -370,6 +451,70 @@ final class PhotoScannerService: ObservableObject {
         }
     }
 
+    /// Detects blurry shots (CPU Laplacian variance) and receipts/documents (Vision classification) offline.
+    func findClutterPhotosIfNeeded() {
+        guard case .loaded(let items) = phase else { return }
+        if case .loaded = clutterPhase { return }
+        if case .scanning = clutterPhase { return }
+
+        // Bounded to 350 newest non-screenshot local photos for minimal battery and thermal impact.
+        let candidates = Array(
+            items
+                .filter { !$0.isVideo && !$0.isScreenshot && $0.isLocallyAvailable }
+                .sorted { $0.creationDate > $1.creationDate }
+                .prefix(350)
+        )
+
+        guard !candidates.isEmpty else {
+            clutterPhase = .loaded([])
+            return
+        }
+
+        clutterPhase = .scanning(
+            processed: 0,
+            total: candidates.count,
+            statusText: "Menganalisis foto blur & struk/dokumen (\(candidates.count) foto)..."
+        )
+
+        activeClutterTask = Task { [weak self] in
+            guard let self else { return }
+            var detected: [ClutterMediaItem] = []
+
+            for (idx, item) in candidates.enumerated() {
+                if Task.isCancelled { return }
+                if let thumb = await self.loadVisionThumbnail(for: item.asset),
+                   let cgImage = thumb.cgImage {
+                    let analysis = await Task.detached(priority: .utility) {
+                        Self.analyzeClutter(cgImage: cgImage)
+                    }.value
+                    if let analysis {
+                        detected.append(
+                            ClutterMediaItem(
+                                id: item.id,
+                                item: item,
+                                kind: analysis.kind,
+                                detailLabel: analysis.detailLabel
+                            )
+                        )
+                    }
+                }
+
+                if idx % 10 == 0 || idx + 1 == candidates.count {
+                    self.clutterPhase = .scanning(
+                        processed: idx + 1,
+                        total: candidates.count,
+                        statusText: "Mendeteksi blur & dokumen (\(idx + 1)/\(candidates.count))..."
+                    )
+                    await Task.yield()
+                }
+            }
+
+            guard !Task.isCancelled else { return }
+            detected.sort { $0.item.byteSize > $1.item.byteSize }
+            self.clutterPhase = .loaded(detected)
+        }
+    }
+
     /// Executes native PhotoKit deletion (moves selected items to Recently Deleted on iOS).
     func deleteAssets(ids: Set<String>) async throws -> Int64 {
         guard case .loaded(let items) = phase else { return 0 }
@@ -382,10 +527,22 @@ final class PhotoScannerService: ObservableObject {
         }
 
         let freedBytes = targets.reduce(Int64(0)) { $0 + $1.byteSize }
-        sessionReclaimedBytes += freedBytes
+        AllTimeReclaimedStore.add(freedBytes)
+        applyDeletedAssetIds(ids, reclaimedBytes: freedBytes)
+        return freedBytes
+    }
 
-        let remaining = items.filter { !ids.contains($0.id) }
-        phase = .loaded(remaining)
+    /// Updates loaded lists immediately after an external PhotoKit deletion (such as batch compression cleanup).
+    func recordExternalDeletion(ids: Set<String>, reclaimedBytes: Int64) {
+        applyDeletedAssetIds(ids, reclaimedBytes: reclaimedBytes)
+    }
+
+    private func applyDeletedAssetIds(_ ids: Set<String>, reclaimedBytes: Int64) {
+        sessionReclaimedBytes += max(0, reclaimedBytes)
+
+        if case .loaded(let items) = phase {
+            phase = .loaded(items.filter { !ids.contains($0.id) })
+        }
 
         if case .loaded(let existingGroups) = duplicatePhase {
             let updatedGroups: [DuplicateGroup] = existingGroups.compactMap { group in
@@ -414,7 +571,9 @@ final class PhotoScannerService: ObservableObject {
             similarPhase = .loaded(updatedSimilar)
         }
 
-        return freedBytes
+        if case .loaded(let existingClutter) = clutterPhase {
+            clutterPhase = .loaded(existingClutter.filter { !ids.contains($0.item.id) })
+        }
     }
 
     /// Loads a square thumbnail for list rows without blocking scrolling.
@@ -496,10 +655,59 @@ final class PhotoScannerService: ObservableObject {
         }
     }
 
-    // MARK: - Private Background Enumeration & Vision Helpers
+    // MARK: - Private Background Enumeration, Albums & Vision Helpers
+
+    private static func fetchScreenRecordingIdentifiers() async -> Set<String> {
+        await Task.detached(priority: .userInitiated) {
+            var ids = Set<String>()
+            let collections = PHAssetCollection.fetchAssetCollections(
+                with: .smartAlbum,
+                subtype: .smartAlbumScreenRecordings,
+                options: nil
+            )
+            collections.enumerateObjects { collection, _, _ in
+                let assets = PHAsset.fetchAssets(in: collection, options: nil)
+                assets.enumerateObjects { asset, _, _ in
+                    ids.insert(asset.localIdentifier)
+                }
+            }
+            return ids
+        }.value
+    }
+
+    private static func fetchUserAlbums() async -> [MediaAlbumFilter] {
+        await Task.detached(priority: .utility) {
+            var results: [MediaAlbumFilter] = []
+            let collections = PHAssetCollection.fetchAssetCollections(with: .album, subtype: .any, options: nil)
+
+            collections.enumerateObjects { collection, _, _ in
+                guard let title = collection.localizedTitle, !title.isEmpty else { return }
+                let assets = PHAsset.fetchAssets(in: collection, options: nil)
+                guard assets.count > 0 else { return }
+                var ids = Set<String>()
+                ids.reserveCapacity(assets.count)
+                assets.enumerateObjects { asset, _, _ in
+                    ids.insert(asset.localIdentifier)
+                }
+                results.append(
+                    MediaAlbumFilter(
+                        id: collection.localIdentifier,
+                        title: title,
+                        assetIds: ids
+                    )
+                )
+            }
+
+            return results
+                .sorted { $0.assetIds.count > $1.assetIds.count }
+                .prefix(25)
+                .map { $0 }
+        }.value
+    }
 
     private static func fetchAssets(
         mediaType: PHAssetMediaType,
+        screenRecordingIds: Set<String>,
         onProgress: @escaping @Sendable (Int, Int) async -> Void
     ) async -> [MediaAssetItem] {
         await Task.detached(priority: .userInitiated) {
@@ -553,7 +761,8 @@ final class PhotoScannerService: ObservableObject {
                     isScreenshot: asset.mediaSubtypes.contains(.photoScreenshot),
                     isLivePhoto: asset.mediaSubtypes.contains(.photoLive),
                     isBurst: asset.representsBurst,
-                    isLocallyAvailable: isLocal
+                    isLocallyAvailable: isLocal,
+                    isScreenRecording: screenRecordingIds.contains(asset.localIdentifier)
                 )
                 collected.append(item)
 
@@ -590,6 +799,31 @@ final class PhotoScannerService: ObservableObject {
                     continuation.resume(returning: streamHasher.finalizeHex())
                 }
             )
+        }
+    }
+
+    nonisolated private static func analyzeClutter(cgImage: CGImage) -> (kind: ClutterKind, detailLabel: String)? {
+        autoreleasepool {
+            if let variance = LaplacianBlurDetector.variance(of: cgImage),
+               variance < LaplacianBlurDetector.blurVarianceThreshold {
+                return (.blurry, String(format: "Ketajaman %.0f (blur)", variance))
+            }
+
+            let request = VNClassifyImageRequest()
+            let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+            do {
+                try handler.perform([request])
+                let keywords = ["receipt", "document", "paper", "invoice", "printed", "text", "page", "notebook", "letter"]
+                if let match = request.results?.first(where: { obs in
+                    obs.confidence >= 0.45 && keywords.contains(where: { obs.identifier.lowercased().contains($0) })
+                }) {
+                    let pct = Int((match.confidence * 100).rounded())
+                    return (.document, "Dokumen/Struk (\(pct)%)")
+                }
+            } catch {
+                return nil
+            }
+            return nil
         }
     }
 

@@ -1,12 +1,18 @@
 import SwiftUI
 
 /// Honest iOS Sandbox utility tab: cleans ByteReaper's own sandbox cache directly,
-/// explains iOS sandbox limits transparently, and provides an interactive per-app cleanup checklist.
+/// shows lifetime saved stats and optional weekly reminder toggle, explains iOS sandbox limits transparently,
+/// and provides an interactive per-app cleanup checklist.
 struct SandboxGuideView: View {
+    let allTimeReclaimedBytes: Int64
     let onSelfCacheCleaned: (Int64) -> Void
+    let onAllTimeStatsReset: () -> Void
 
     @State private var selfCacheBytes: Int64 = StorageTelemetryService.measureSelfCacheBytes()
     @State private var lastCleanupMessage: String?
+    @State private var weeklyReminderEnabled: Bool = NotificationReminderService.isWeeklyReminderEnabled()
+    @State private var reminderStatusMessage: String?
+    @State private var confirmResetStats = false
     @State private var checklist: [AppCleanupChecklistItem] = Self.loadChecklist()
 
     private static let checklistDefaultsKey = "bytereaper.cleanupChecklist.v1"
@@ -14,6 +20,7 @@ struct SandboxGuideView: View {
     var body: some View {
         VStack(spacing: 12) {
             selfCacheCard
+            statsAndReminderCard
             sandboxTransparencyCard
             guidedChecklistCard
         }
@@ -21,6 +28,18 @@ struct SandboxGuideView: View {
         .padding(.bottom, 110)
         .onAppear {
             selfCacheBytes = StorageTelemetryService.measureSelfCacheBytes()
+            weeklyReminderEnabled = NotificationReminderService.isWeeklyReminderEnabled()
+        }
+        .confirmationDialog(
+            "Reset total riwayat ruang terhemat?",
+            isPresented: $confirmResetStats,
+            titleVisibility: .visible
+        ) {
+            Button("Reset Statistik", role: .destructive) {
+                AllTimeReclaimedStore.reset()
+                onAllTimeStatsReset()
+            }
+            Button("Batal", role: .cancel) {}
         }
     }
 
@@ -37,7 +56,7 @@ struct SandboxGuideView: View {
                     .foregroundStyle(CyberTheme.cyberCyan)
             }
 
-            Text("Menghapus thumbnail sementara dan berkas tmp yang dibuat ByteReaper selama proses pemindaian.")
+            Text("Menghapus thumbnail sementara dan berkas tmp yang dibuat ByteReaper selama proses pemindaian atau kompresi.")
                 .font(.caption)
                 .foregroundStyle(CyberTheme.textSecondary)
 
@@ -61,6 +80,80 @@ struct SandboxGuideView: View {
                     .frame(maxWidth: .infinity)
                     .frame(minHeight: 46)
                     .background(CyberTheme.cyberCyan, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            }
+        }
+        .padding(16)
+        .background(CyberTheme.elevatedSurface, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(CyberTheme.hairlineBorder, lineWidth: 1)
+        )
+    }
+
+    private var statsAndReminderCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Label("Total Ruang Dihemat", systemImage: "chart.bar.fill")
+                    .font(.headline)
+                    .foregroundStyle(CyberTheme.textPrimary)
+                Spacer()
+                Text(ByteFormatter.string(from: allTimeReclaimedBytes))
+                    .font(.subheadline.weight(.bold))
+                    .monospacedDigit()
+                    .foregroundStyle(CyberTheme.acidMint)
+            }
+
+            if allTimeReclaimedBytes > 0 {
+                HStack {
+                    Text("Akumulasi permanen dari penghapusan dan kompresi di ByteReaper.")
+                        .font(.caption)
+                        .foregroundStyle(CyberTheme.textSecondary)
+                    Spacer()
+                    Button("Reset") {
+                        confirmResetStats = true
+                    }
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(CyberTheme.crimsonText)
+                }
+            }
+
+            Rectangle()
+                .fill(CyberTheme.hairlineBorder)
+                .frame(height: 1)
+
+            Toggle(isOn: Binding(
+                get: { weeklyReminderEnabled },
+                set: { newValue in
+                    Task {
+                        let applied = await NotificationReminderService.setWeeklyReminder(enabled: newValue)
+                        await MainActor.run {
+                            weeklyReminderEnabled = newValue && applied
+                            if newValue && !applied {
+                                reminderStatusMessage = "Izin notifikasi ditolak iOS. Aktifkan di Pengaturan > Notifikasi > ByteReaper."
+                            } else if newValue {
+                                reminderStatusMessage = "Pengingat aktif setiap Minggu pukul 10:00."
+                            } else {
+                                reminderStatusMessage = nil
+                            }
+                        }
+                    }
+                }
+            )) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Pengingat Bersih-Bersih Mingguan")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(CyberTheme.textPrimary)
+                    Text("Notifikasi lokal ringan tiap Minggu pagi (tanpa berjalan di latar belakang).")
+                        .font(.caption2)
+                        .foregroundStyle(CyberTheme.textSecondary)
+                }
+            }
+            .tint(CyberTheme.cyberCyan)
+
+            if let reminderStatusMessage {
+                Text(reminderStatusMessage)
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(weeklyReminderEnabled ? CyberTheme.acidMint : CyberTheme.crimsonText)
             }
         }
         .padding(16)
@@ -212,4 +305,3 @@ struct SandboxGuideView: View {
         UserDefaults.standard.set(encoded, forKey: checklistDefaultsKey)
     }
 }
-

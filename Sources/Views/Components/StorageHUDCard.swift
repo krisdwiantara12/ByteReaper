@@ -6,6 +6,7 @@ import SwiftUI
 struct StorageHUDCard: View {
     let snapshot: DeviceStorageSnapshot
     let reclaimedBytes: Int64
+    var allTimeReclaimedBytes: Int64 = 0
     let isScanning: Bool
     var isCompact: Bool = false
     let onRefresh: () -> Void
@@ -111,7 +112,15 @@ struct StorageHUDCard: View {
                     Spacer()
 
                     if reclaimedBytes > 0 {
-                        Text("+\(ByteFormatter.string(from: reclaimedBytes)) dihapus")
+                        Text("+\(ByteFormatter.string(from: reclaimedBytes)) sesi")
+                            .font(.caption.weight(.semibold))
+                            .monospacedDigit()
+                            .foregroundStyle(CyberTheme.mintInk)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(CyberTheme.acidMint, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                    } else if allTimeReclaimedBytes > 0 {
+                        Text("Total \(ByteFormatter.string(from: allTimeReclaimedBytes))")
                             .font(.caption.weight(.semibold))
                             .monospacedDigit()
                             .foregroundStyle(CyberTheme.mintInk)

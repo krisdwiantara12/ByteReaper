@@ -2,8 +2,8 @@ import Photos
 import SwiftUI
 
 /// Scans PhotoKit assets, ranks them strictly from largest byte size to smallest,
-/// supports category filtering, Local-only toggle, preview & video compression,
-/// SHA-256 duplicates, Vision similar photos, and batch delete.
+/// supports category, age, album, and Local-only filters, preview & video/ProRAW compression,
+/// SHA-256 duplicates, Vision similar photos, offline blur/document detection, and batch delete.
 struct MediaCleanerView: View {
     @ObservedObject var scanner: PhotoScannerService
     @Binding var selectedIds: Set<String>
@@ -11,28 +11,48 @@ struct MediaCleanerView: View {
     let onVideoCompressed: () -> Void
 
     @State private var activeFilter: MediaCategoryFilter = .allLargest
+    @State private var ageFilter: MediaAgeFilter = .all
+    @State private var selectedAlbumId: String?
     @State private var localOnly: Bool = false
     @State private var searchText: String = ""
     @State private var previewItem: MediaAssetItem?
 
+    private var activeAlbum: MediaAlbumFilter? {
+        guard let selectedAlbumId else { return nil }
+        return scanner.availableAlbums.first { $0.id == selectedAlbumId }
+    }
+
     private var filteredItems: [MediaAssetItem] {
         guard case .loaded(let allItems) = scanner.phase else { return [] }
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let albumIds = activeAlbum?.assetIds
+        let now = Date()
 
         let categoryFiltered = allItems.filter { item in
             if localOnly && !item.isLocallyAvailable {
                 return false
             }
+            if !ageFilter.matches(creationDate: item.creationDate, referenceDate: now) {
+                return false
+            }
+            if let albumIds, !albumIds.contains(item.id) {
+                return false
+            }
+
             switch activeFilter {
             case .allLargest:
                 return true
             case .videos:
                 return item.isVideo
+            case .screenRecordings:
+                return item.isVideo && item.isScreenRecording
+            case .largePhotos:
+                return item.isLargeStaticPhoto
             case .screenshots:
                 return item.isScreenshot
             case .liveAndBurst:
                 return item.isLivePhoto || item.isBurst
-            case .duplicates, .similar:
+            case .duplicates, .similar, .blurOrDocuments:
                 return false
             }
         }
@@ -41,6 +61,10 @@ struct MediaCleanerView: View {
             return categoryFiltered
         }
         return categoryFiltered.filter { $0.filename.lowercased().contains(query) }
+    }
+
+    private var filteredTotalBytes: Int64 {
+        filteredItems.reduce(0) { $0 + $1.byteSize }
     }
 
     private var maxBytesInFilter: Int64 {
@@ -84,12 +108,21 @@ struct MediaCleanerView: View {
             case .loaded(let allItems):
                 if allItems.isEmpty {
                     emptyStateCard(title: "Galeri Foto Kosong", detail: "Tidak ditemukan foto atau video yang tersimpan di perpustakaan foto.")
-                } else if activeFilter == .duplicates {
-                    duplicatesSection
-                } else if activeFilter == .similar {
-                    similarSection
                 } else {
-                    loadedMediaList
+                    if activeFilter == .allLargest {
+                        MediaStorageBreakdownBar(breakdown: StorageBreakdown.compute(from: allItems))
+                            .padding(.horizontal, 16)
+                    }
+
+                    if activeFilter == .duplicates {
+                        duplicatesSection
+                    } else if activeFilter == .similar {
+                        similarSection
+                    } else if activeFilter == .blurOrDocuments {
+                        clutterSection
+                    } else {
+                        loadedMediaList
+                    }
                 }
             }
         }
@@ -106,6 +139,8 @@ struct MediaCleanerView: View {
                 scanner.findDuplicatesIfNeeded()
             } else if newValue == .similar {
                 scanner.findSimilarPhotosIfNeeded()
+            } else if newValue == .blurOrDocuments {
+                scanner.findClutterPhotosIfNeeded()
             }
         }
     }
@@ -164,26 +199,6 @@ struct MediaCleanerView: View {
                 )
 
                 Button {
-                    HapticFeedback.selection()
-                    localOnly.toggle()
-                } label: {
-                    Text("Lokal")
-                        .font(.caption.weight(.bold))
-                        .foregroundStyle(localOnly ? CyberTheme.cyanInk : CyberTheme.textSecondary)
-                        .padding(.horizontal, 12)
-                        .frame(minHeight: 44)
-                        .background(
-                            localOnly ? CyberTheme.cyberCyan : CyberTheme.elevatedSurface,
-                            in: RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        )
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                .strokeBorder(localOnly ? CyberTheme.cyberCyan : CyberTheme.hairlineBorder, lineWidth: 1)
-                        )
-                }
-                .accessibilityLabel("Filter hanya file lokal di memori iPhone")
-
-                Button {
                     toggleSelectTopTen()
                 } label: {
                     Text(selectedIds.isEmpty ? "Top 10" : "Reset")
@@ -196,6 +211,110 @@ struct MediaCleanerView: View {
                             RoundedRectangle(cornerRadius: 12, style: .continuous)
                                 .strokeBorder(CyberTheme.hairlineBorder, lineWidth: 1)
                         )
+                }
+            }
+            .padding(.horizontal, 16)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    Button {
+                        HapticFeedback.selection()
+                        localOnly.toggle()
+                    } label: {
+                        Label("Lokal", systemImage: "internaldrive")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(localOnly ? CyberTheme.cyanInk : CyberTheme.textSecondary)
+                            .padding(.horizontal, 12)
+                            .frame(minHeight: 40)
+                            .background(
+                                localOnly ? CyberTheme.cyberCyan : CyberTheme.elevatedSurface,
+                                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                    .strokeBorder(localOnly ? CyberTheme.cyberCyan : CyberTheme.hairlineBorder, lineWidth: 1)
+                            )
+                    }
+                    .accessibilityLabel("Filter hanya file lokal di memori iPhone")
+
+                    Menu {
+                        ForEach(MediaAgeFilter.allCases) { option in
+                            Button {
+                                HapticFeedback.selection()
+                                ageFilter = option
+                            } label: {
+                                if ageFilter == option {
+                                    Label(option.rawValue, systemImage: "checkmark")
+                                } else {
+                                    Text(option.rawValue)
+                                }
+                            }
+                        }
+                    } label: {
+                        Label(ageFilter.rawValue, systemImage: "calendar")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(ageFilter == .all ? CyberTheme.textSecondary : CyberTheme.cyberCyan)
+                            .padding(.horizontal, 12)
+                            .frame(minHeight: 40)
+                            .background(CyberTheme.elevatedSurface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                    .strokeBorder(ageFilter == .all ? CyberTheme.hairlineBorder : CyberTheme.cyberCyan, lineWidth: 1)
+                            )
+                    }
+
+                    if !scanner.availableAlbums.isEmpty {
+                        Menu {
+                            Button {
+                                selectedAlbumId = nil
+                            } label: {
+                                if selectedAlbumId == nil {
+                                    Label("Semua Album", systemImage: "checkmark")
+                                } else {
+                                    Text("Semua Album")
+                                }
+                            }
+                            Divider()
+                            ForEach(scanner.availableAlbums) { album in
+                                Button {
+                                    selectedAlbumId = album.id
+                                } label: {
+                                    let label = "\(album.title) (\(album.assetIds.count))"
+                                    if selectedAlbumId == album.id {
+                                        Label(label, systemImage: "checkmark")
+                                    } else {
+                                        Text(label)
+                                    }
+                                }
+                            }
+                        } label: {
+                            Label(activeAlbum?.title ?? "Semua Album", systemImage: "rectangle.stack")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(activeAlbum == nil ? CyberTheme.textSecondary : CyberTheme.cyberCyan)
+                                .lineLimit(1)
+                                .padding(.horizontal, 12)
+                                .frame(minHeight: 40)
+                                .background(CyberTheme.elevatedSurface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                        .strokeBorder(activeAlbum == nil ? CyberTheme.hairlineBorder : CyberTheme.cyberCyan, lineWidth: 1)
+                                )
+                        }
+                    }
+                }
+                .padding(.horizontal, 16)
+            }
+
+            HStack {
+                Text("\(filteredItems.count) item · Total \(ByteFormatter.string(from: filteredTotalBytes))")
+                    .font(.caption.weight(.semibold))
+                    .monospacedDigit()
+                    .foregroundStyle(CyberTheme.textSecondary)
+                Spacer()
+                if activeFilter == .videos || activeFilter == .screenRecordings {
+                    Text("Pilih video -> Kompres di bawah")
+                        .font(.caption2)
+                        .foregroundStyle(CyberTheme.cyberCyan)
                 }
             }
             .padding(.horizontal, 16)
@@ -346,6 +465,71 @@ struct MediaCleanerView: View {
         }
     }
 
+    @ViewBuilder
+    private var clutterSection: some View {
+        switch scanner.clutterPhase {
+        case .idle:
+            scanningStateCard(processed: 0, total: 0, statusText: "Menyiapkan deteksi blur & dokumen...")
+                .onAppear { scanner.findClutterPhotosIfNeeded() }
+        case .scanning(let processed, let total, let statusText):
+            scanningStateCard(processed: processed, total: total, statusText: statusText)
+        case .permissionDenied:
+            permissionDeniedCard
+        case .error(let msg):
+            errorStateCard(message: msg)
+        case .loaded(let entries):
+            if entries.isEmpty {
+                emptyStateCard(
+                    title: "Tidak Ada Foto Blur atau Dokumen",
+                    detail: "Tidak terdeteksi foto buram atau foto struk/kertas pada 350 foto lokal terbaru."
+                )
+            } else {
+                let totalClutterBytes = entries.reduce(Int64(0)) { $0 + $1.item.byteSize }
+                VStack(spacing: 10) {
+                    HStack {
+                        Text("\(entries.count) kandidat · \(ByteFormatter.string(from: totalClutterBytes))")
+                            .font(.caption.weight(.semibold))
+                            .monospacedDigit()
+                            .foregroundStyle(CyberTheme.textSecondary)
+                        Spacer()
+                        Button {
+                            HapticFeedback.selection()
+                            for entry in entries {
+                                selectedIds.insert(entry.item.id)
+                            }
+                        } label: {
+                            Text("Pilih Semua")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(CyberTheme.cyberCyan)
+                                .padding(.horizontal, 12)
+                                .frame(minHeight: 44)
+                                .background(CyberTheme.elevatedSurface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                        .strokeBorder(CyberTheme.hairlineBorder, lineWidth: 1)
+                                )
+                        }
+                    }
+                    .padding(.horizontal, 16)
+
+                    LazyVStack(spacing: 8) {
+                        ForEach(entries) { entry in
+                            ClutterMediaRow(
+                                entry: entry,
+                                isSelected: selectedIds.contains(entry.item.id),
+                                scanner: scanner,
+                                onPreview: { previewItem = entry.item },
+                                onToggleSelect: { toggleSelection(for: entry.item.id) }
+                            )
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 110)
+                }
+            }
+        }
+    }
+
     private var idleStateCard: some View {
         VStack(spacing: 14) {
             Image(systemName: "photo.stack")
@@ -356,7 +540,7 @@ struct MediaCleanerView: View {
                 .font(.headline)
                 .foregroundStyle(CyberTheme.textPrimary)
 
-            Text("ByteReaper memindai video terbesar lebih dulu agar langsung tampil cepat, menandai file Lokal vs iCloud, dan mengurutkannya dari ukuran terbesar.")
+            Text("ByteReaper memindai video terbesar lebih dulu agar langsung tampil cepat, memisahkan Screen Recording, menandai file Lokal vs iCloud, dan mengurutkannya dari ukuran terbesar.")
                 .font(.subheadline)
                 .foregroundStyle(CyberTheme.textSecondary)
                 .multilineTextAlignment(.center)
@@ -559,7 +743,60 @@ struct MediaCleanerView: View {
     }
 }
 
-// MARK: - Row & Cluster Group Views
+// MARK: - Breakdown, Row & Cluster Views
+
+private struct MediaStorageBreakdownBar: View {
+    let breakdown: StorageBreakdown
+
+    private var segments: [(label: String, bytes: Int64, color: Color)] {
+        [
+            ("Video", breakdown.videoBytes, CyberTheme.cyberCyan),
+            ("Screen Rec", breakdown.screenRecordingBytes, CyberTheme.crimsonText),
+            ("Screenshot", breakdown.screenshotBytes, CyberTheme.acidMint),
+            ("Foto", breakdown.photoBytes, CyberTheme.textSecondary)
+        ].filter { $0.bytes > 0 }
+    }
+
+    var body: some View {
+        if breakdown.totalBytes > 0 {
+            VStack(alignment: .leading, spacing: 8) {
+                GeometryReader { geo in
+                    let total = Double(breakdown.totalBytes)
+                    HStack(spacing: 2) {
+                        ForEach(segments, id: \.label) { segment in
+                            let fraction = max(0.02, Double(segment.bytes) / total)
+                            RoundedRectangle(cornerRadius: 3, style: .continuous)
+                                .fill(segment.color)
+                                .frame(width: max(4, (geo.size.width - CGFloat(segments.count - 1) * 2) * fraction))
+                        }
+                    }
+                }
+                .frame(height: 8)
+
+                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], alignment: .leading, spacing: 6) {
+                    ForEach(segments, id: \.label) { segment in
+                        HStack(spacing: 6) {
+                            Circle()
+                                .fill(segment.color)
+                                .frame(width: 7, height: 7)
+                            Text("\(segment.label): \(ByteFormatter.string(from: segment.bytes))")
+                                .font(.caption2.weight(.medium))
+                                .monospacedDigit()
+                                .foregroundStyle(CyberTheme.textSecondary)
+                                .lineLimit(1)
+                        }
+                    }
+                }
+            }
+            .padding(12)
+            .background(CyberTheme.elevatedSurface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .strokeBorder(CyberTheme.hairlineBorder, lineWidth: 1)
+            )
+        }
+    }
+}
 
 private struct MediaAssetRow: View {
     let item: MediaAssetItem
@@ -577,9 +814,13 @@ private struct MediaAssetRow: View {
     }
 
     private var typeLabel: String {
+        if item.isVideo && item.isScreenRecording {
+            return "Screen Rec · \(ByteFormatter.durationString(item.duration))"
+        }
         if item.isVideo { return "Video · \(ByteFormatter.durationString(item.duration))" }
         if item.isScreenshot { return "Screenshot · \(item.resolutionLabel)" }
         if item.isLivePhoto { return "Live Photo · \(item.resolutionLabel)" }
+        if item.isLargeStaticPhoto { return "Foto Jumbo · \(item.resolutionLabel)" }
         return "Foto · \(item.resolutionLabel)"
     }
 
@@ -606,9 +847,9 @@ private struct MediaAssetRow: View {
                         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
 
                         if item.isVideo {
-                            Image(systemName: "play.fill")
+                            Image(systemName: item.isScreenRecording ? "record.circle" : "play.fill")
                                 .font(.caption2)
-                                .foregroundStyle(Color.white)
+                                .foregroundStyle(item.isScreenRecording ? CyberTheme.crimsonText : Color.white)
                                 .padding(4)
                                 .background(CyberTheme.oledBlack.opacity(0.75), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
                                 .padding(3)
@@ -632,7 +873,7 @@ private struct MediaAssetRow: View {
                             Text(typeLabel)
                                 .font(.caption)
                                 .monospacedDigit()
-                                .foregroundStyle(CyberTheme.textSecondary)
+                                .foregroundStyle(item.isScreenRecording ? CyberTheme.crimsonText : CyberTheme.textSecondary)
                                 .lineLimit(1)
 
                             Spacer()
@@ -675,6 +916,90 @@ private struct MediaAssetRow: View {
         )
         .task(id: item.id) {
             thumbnail = await scanner.loadThumbnail(for: item.asset, targetSize: CGSize(width: 120, height: 120))
+        }
+    }
+}
+
+private struct ClutterMediaRow: View {
+    let entry: ClutterMediaItem
+    let isSelected: Bool
+    let scanner: PhotoScannerService
+    let onPreview: () -> Void
+    let onToggleSelect: () -> Void
+
+    @State private var thumbnail: UIImage?
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Button(action: onPreview) {
+                HStack(spacing: 12) {
+                    Group {
+                        if let thumbnail {
+                            Image(uiImage: thumbnail)
+                                .resizable()
+                                .scaledToFill()
+                        } else {
+                            Rectangle()
+                                .fill(CyberTheme.oledBlack)
+                                .overlay(
+                                    Image(systemName: entry.kind == .blurry ? "eye.slash" : "doc.text")
+                                        .foregroundStyle(CyberTheme.textSecondary)
+                                )
+                        }
+                    }
+                    .frame(width: 52, height: 52)
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text(entry.item.filename)
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(CyberTheme.textPrimary)
+                                .lineLimit(1)
+                            Spacer()
+                            Text(ByteFormatter.string(from: entry.item.byteSize))
+                                .font(.subheadline.weight(.bold))
+                                .monospacedDigit()
+                                .foregroundStyle(CyberTheme.cyberCyan)
+                        }
+
+                        HStack(spacing: 6) {
+                            Text(entry.kind == .blurry ? "BLUR" : "DOKUMEN")
+                                .font(.caption2.weight(.bold))
+                                .foregroundStyle(entry.kind == .blurry ? Color.white : CyberTheme.cyanInk)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(
+                                    entry.kind == .blurry ? CyberTheme.crimsonButtonFill : CyberTheme.cyberCyan,
+                                    in: RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                )
+
+                            Text(entry.detailLabel)
+                                .font(.caption2)
+                                .monospacedDigit()
+                                .foregroundStyle(CyberTheme.textSecondary)
+                                .lineLimit(1)
+                        }
+                    }
+                }
+            }
+            .buttonStyle(.plain)
+
+            Button(action: onToggleSelect) {
+                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                    .font(.title3)
+                    .foregroundStyle(isSelected ? CyberTheme.cyberCyan : CyberTheme.textSecondary)
+                    .frame(width: 44, height: 44)
+            }
+        }
+        .padding(10)
+        .background(CyberTheme.elevatedSurface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(isSelected ? CyberTheme.cyberCyan.opacity(0.75) : CyberTheme.hairlineBorder, lineWidth: 1)
+        )
+        .task(id: entry.id) {
+            thumbnail = await scanner.loadThumbnail(for: entry.item.asset, targetSize: CGSize(width: 110, height: 110))
         }
     }
 }

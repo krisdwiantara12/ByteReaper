@@ -1,4 +1,5 @@
 import Foundation
+import UserNotifications
 
 /// Reads real iOS volume telemetry and measures/clears this app's own sandbox cache directories.
 enum StorageTelemetryService {
@@ -81,4 +82,113 @@ enum StorageTelemetryService {
         return sum
     }
 }
+
+/// Persists cumulative bytes reclaimed across app sessions.
+enum AllTimeReclaimedStore {
+    static let storageKey = "ByteReaper.AllTimeReclaimedBytes.v1"
+
+    static func totalBytes(defaults: UserDefaults = .standard) -> Int64 {
+        let value = defaults.object(forKey: storageKey) as? NSNumber
+        return max(0, value?.int64Value ?? 0)
+    }
+
+    @discardableResult
+    static func add(_ bytes: Int64, defaults: UserDefaults = .standard) -> Int64 {
+        guard bytes > 0 else { return totalBytes(defaults: defaults) }
+        let updated = totalBytes(defaults: defaults) + bytes
+        defaults.set(NSNumber(value: updated), forKey: storageKey)
+        return updated
+    }
+
+    static func reset(defaults: UserDefaults = .standard) {
+        defaults.removeObject(forKey: storageKey)
+    }
+}
+
+/// Manages local notifications for compression completion and optional weekly cleanup reminders.
+enum NotificationReminderService {
+    static let weeklyEnabledKey = "ByteReaper.WeeklyReminderEnabled.v1"
+    static let weeklyIdentifier = "com.kris.storage.bytereaper.weeklyReminder"
+
+    static func isWeeklyReminderEnabled(defaults: UserDefaults = .standard) -> Bool {
+        defaults.bool(forKey: weeklyEnabledKey)
+    }
+
+    static func requestAuthorizationIfNeeded() async -> Bool {
+        let center = UNUserNotificationCenter.current()
+        let settings = await center.notificationSettings()
+        switch settings.authorizationStatus {
+        case .authorized, .provisional, .ephemeral:
+            return true
+        case .notDetermined:
+            return (try? await center.requestAuthorization(options: [.alert, .sound])) ?? false
+        case .denied:
+            return false
+        @unknown default:
+            return false
+        }
+    }
+
+    @discardableResult
+    static func setWeeklyReminder(enabled: Bool, defaults: UserDefaults = .standard) async -> Bool {
+        let center = UNUserNotificationCenter.current()
+        center.removePendingNotificationRequests(withIdentifiers: [weeklyIdentifier])
+
+        guard enabled else {
+            defaults.set(false, forKey: weeklyEnabledKey)
+            return true
+        }
+
+        let granted = await requestAuthorizationIfNeeded()
+        guard granted else {
+            defaults.set(false, forKey: weeklyEnabledKey)
+            return false
+        }
+
+        let content = UNMutableNotificationContent()
+        content.title = "Saatnya Cek Storage iPhone"
+        content.body = "Cek video 4K baru, screenshot lama, dan file duplikat di ByteReaper."
+        content.sound = .default
+
+        var components = DateComponents()
+        components.weekday = 1 // Sunday 10:00 AM local time
+        components.hour = 10
+        components.minute = 0
+
+        let trigger = UNCalendarNotificationTrigger(dateMatching: components, repeats: true)
+        let request = UNNotificationRequest(identifier: weeklyIdentifier, content: content, trigger: trigger)
+
+        do {
+            try await center.add(request)
+            defaults.set(true, forKey: weeklyEnabledKey)
+            return true
+        } catch {
+            defaults.set(false, forKey: weeklyEnabledKey)
+            return false
+        }
+    }
+
+    static func sendCompressionNotification(
+        title: String,
+        body: String,
+        identifier: String = "com.kris.storage.bytereaper.compression"
+    ) async {
+        let center = UNUserNotificationCenter.current()
+        let settings = await center.notificationSettings()
+        let allowed = settings.authorizationStatus == .authorized
+            || settings.authorizationStatus == .provisional
+            || settings.authorizationStatus == .ephemeral
+        guard allowed else { return }
+
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+
+        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 1, repeats: false)
+        let request = UNNotificationRequest(identifier: identifier, content: content, trigger: trigger)
+        try? await center.add(request)
+    }
+}
+
 

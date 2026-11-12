@@ -2,6 +2,22 @@ import AVFoundation
 import Foundation
 import Photos
 
+/// Failure categories for video export so interrupted background runs can resume cleanly.
+enum VideoExportFailure: LocalizedError {
+    case interrupted(String)
+    case cancelled
+    case failed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .interrupted(let message), .failed(let message):
+            return message
+        case .cancelled:
+            return "Kompresi video dibatalkan."
+        }
+    }
+}
+
 /// Compresses large iOS videos (MOV / 4K / ProRes) into smaller MP4/HEVC copies
 /// and saves the compressed version to the Photo Library with original date/location preserved.
 enum VideoCompressionService {
@@ -17,6 +33,12 @@ enum VideoCompressionService {
                 AVAssetExportPresetHEVC1920x1080,
                 AVAssetExportPreset1920x1080,
                 AVAssetExportPresetHEVCHighestQuality,
+                AVAssetExportPresetMediumQuality
+            ]
+        case .compact720p:
+            candidates = [
+                AVAssetExportPreset1280x720,
+                AVAssetExportPreset960x540,
                 AVAssetExportPresetMediumQuality
             ]
         case .mp41080p:
@@ -37,22 +59,30 @@ enum VideoCompressionService {
     static func compressAndSave(
         item: MediaAssetItem,
         preset choice: VideoCompressionPreset,
+        stripAudio: Bool = false,
         onProgress: @escaping @Sendable (Double) async -> Void
     ) async throws -> VideoCompressionResult {
         guard item.isVideo else {
-            throw compressionError("Hanya file video yang dapat dikompresi.")
+            throw VideoExportFailure.failed("Hanya file video yang dapat dikompresi.")
         }
 
         await onProgress(0.05)
-        guard let avAsset = await fetchAVAsset(for: item.asset) else {
-            throw compressionError("Video tidak tersedia secara lokal atau gagal diunduh dari iCloud.")
+        guard let sourceAsset = await fetchAVAsset(for: item.asset) else {
+            throw VideoExportFailure.failed("Video tidak tersedia secara lokal atau gagal diunduh dari iCloud.")
         }
 
-        let compatible = AVAssetExportSession.exportPresets(compatibleWith: avAsset)
+        let exportAsset: AVAsset
+        if stripAudio {
+            exportAsset = try await makeVideoOnlyAsset(from: sourceAsset)
+        } else {
+            exportAsset = sourceAsset
+        }
+
+        let compatible = AVAssetExportSession.exportPresets(compatibleWith: exportAsset)
         let chosenPreset = preferredExportPreset(compatiblePresets: compatible, choice: choice)
 
-        guard let exportSession = AVAssetExportSession(asset: avAsset, presetName: chosenPreset) else {
-            throw compressionError("Perangkat tidak mendukung preset kompresi untuk video ini.")
+        guard let exportSession = AVAssetExportSession(asset: exportAsset, presetName: chosenPreset) else {
+            throw VideoExportFailure.failed("Perangkat tidak mendukung preset kompresi untuk video ini.")
         }
 
         let outputURL = FileManager.default.temporaryDirectory
@@ -68,27 +98,40 @@ enum VideoCompressionService {
             while !Task.isCancelled {
                 let p = Double(holder.session.progress)
                 await onProgress(min(0.95, max(0.08, p)))
-                try? await Task.sleep(nanoseconds: 200_000_000)
+                try? await Task.sleep(nanoseconds: 250_000_000)
             }
         }
 
         defer { progressTask.cancel() }
 
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            holder.session.exportAsynchronously {
-                switch holder.session.status {
-                case .completed:
-                    continuation.resume()
-                case .failed:
-                    let err = holder.session.error ?? compressionError("Ekspor video gagal.")
-                    continuation.resume(throwing: err)
-                case .cancelled:
-                    let err = holder.session.error ?? compressionError("Kompresi video dibatalkan.")
-                    continuation.resume(throwing: err)
-                default:
-                    continuation.resume(throwing: compressionError("Status ekspor video tidak dikenal."))
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                holder.session.exportAsynchronously {
+                    switch holder.session.status {
+                    case .completed:
+                        continuation.resume()
+                    case .failed:
+                        if let err = holder.session.error as NSError? {
+                            if err.domain == AVFoundationErrorDomain,
+                               err.code == AVError.Code.operationInterrupted.rawValue || err.code == -11847 {
+                                continuation.resume(throwing: VideoExportFailure.interrupted(
+                                    "Kompresi dijeda iOS karena aplikasi masuk latar belakang."
+                                ))
+                            } else {
+                                continuation.resume(throwing: VideoExportFailure.failed(err.localizedDescription))
+                            }
+                        } else {
+                            continuation.resume(throwing: VideoExportFailure.failed("Ekspor video gagal."))
+                        }
+                    case .cancelled:
+                        continuation.resume(throwing: VideoExportFailure.cancelled)
+                    default:
+                        continuation.resume(throwing: VideoExportFailure.failed("Status ekspor video tidak dikenal."))
+                    }
                 }
             }
+        } onCancel: {
+            holder.cancelIfActive()
         }
 
         progressTask.cancel()
@@ -96,6 +139,13 @@ enum VideoCompressionService {
 
         let attrs = try FileManager.default.attributesOfItem(atPath: outputURL.path)
         let compressedSize = (attrs[.size] as? NSNumber)?.int64Value ?? 0
+        guard compressedSize > 0 else {
+            throw VideoExportFailure.failed("File hasil kompresi kosong.")
+        }
+
+        if !stripAudio && item.byteSize > 0 && compressedSize >= item.byteSize {
+            throw VideoExportFailure.failed("Video ini sudah efisien; ukuran hasil ekspor tidak lebih kecil.")
+        }
 
         let savedIdBox = LockedStringBox()
         let creationDate = item.asset.creationDate
@@ -121,6 +171,28 @@ enum VideoCompressionService {
         )
     }
 
+    private static func makeVideoOnlyAsset(from source: AVAsset) async throws -> AVAsset {
+        let videoTracks = try await source.loadTracks(withMediaType: .video)
+        guard let firstTrack = videoTracks.first else {
+            throw VideoExportFailure.failed("Track video tidak ditemukan untuk mode tanpa audio.")
+        }
+
+        let timeRange = try await firstTrack.load(.timeRange)
+        let transform = try await firstTrack.load(.preferredTransform)
+
+        let composition = AVMutableComposition()
+        guard let mutableTrack = composition.addMutableTrack(
+            withMediaType: .video,
+            preferredTrackID: kCMPersistentTrackID_Invalid
+        ) else {
+            throw VideoExportFailure.failed("Gagal menyiapkan komposisi video tanpa audio.")
+        }
+
+        try mutableTrack.insertTimeRange(timeRange, of: firstTrack, at: .zero)
+        mutableTrack.preferredTransform = transform
+        return composition
+    }
+
     private static func fetchAVAsset(for phAsset: PHAsset) async -> AVAsset? {
         await withCheckedContinuation { continuation in
             let options = PHVideoRequestOptions()
@@ -132,20 +204,23 @@ enum VideoCompressionService {
             }
         }
     }
-
-    private static func compressionError(_ message: String) -> NSError {
-        NSError(
-            domain: "ByteReaper.VideoCompression",
-            code: 1,
-            userInfo: [NSLocalizedDescriptionKey: message]
-        )
-    }
 }
 
 private final class ExportSessionBox: @unchecked Sendable {
     let session: AVAssetExportSession
+    private let lock = NSLock()
+
     init(session: AVAssetExportSession) {
         self.session = session
+    }
+
+    func cancelIfActive() {
+        lock.lock()
+        let status = session.status
+        lock.unlock()
+        if status == .exporting || status == .waiting {
+            session.cancelExport()
+        }
     }
 }
 
