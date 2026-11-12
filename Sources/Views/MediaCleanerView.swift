@@ -12,6 +12,7 @@ struct MediaCleanerView: View {
 
     @State private var activeFilter: MediaCategoryFilter = .allLargest
     @State private var ageFilter: MediaAgeFilter = .all
+    @State private var sortOrder: MediaSortOrder = .largestFirst
     @State private var selectedAlbumId: String?
     @State private var localOnly: Bool = false
     @State private var searchText: String = ""
@@ -57,10 +58,20 @@ struct MediaCleanerView: View {
             }
         }
 
-        if query.isEmpty {
-            return categoryFiltered
+        let searched = query.isEmpty ? categoryFiltered : categoryFiltered.filter { $0.filename.lowercased().contains(query) }
+        switch sortOrder {
+        case .largestFirst:
+            return searched
+        case .highestBitrate:
+            return searched.sorted {
+                if $0.estimatedMbps != $1.estimatedMbps {
+                    return $0.estimatedMbps > $1.estimatedMbps
+                }
+                return $0.byteSize > $1.byteSize
+            }
+        case .oldestFirst:
+            return searched.sorted { $0.creationDate < $1.creationDate }
         }
-        return categoryFiltered.filter { $0.filename.lowercased().contains(query) }
     }
 
     private var filteredTotalBytes: Int64 {
@@ -68,7 +79,7 @@ struct MediaCleanerView: View {
     }
 
     private var maxBytesInFilter: Int64 {
-        filteredItems.first?.byteSize ?? 1
+        filteredItems.map(\.byteSize).max() ?? 1
     }
 
     var body: some View {
@@ -112,6 +123,19 @@ struct MediaCleanerView: View {
                     if activeFilter == .allLargest {
                         MediaStorageBreakdownBar(breakdown: StorageBreakdown.compute(from: allItems))
                             .padding(.horizontal, 16)
+
+                        let sweepSummary = SmartSweepSummary.compute(from: allItems)
+                        if searchText.isEmpty && sweepSummary.hasAnyOpportunity {
+                            SmartSweepCard(summary: sweepSummary) { targetFilter, targetAge in
+                                HapticFeedback.selection()
+                                withAnimation(.easeInOut(duration: 0.16)) {
+                                    activeFilter = targetFilter
+                                    ageFilter = targetAge
+                                    sortOrder = targetFilter == .videos ? .highestBitrate : .largestFirst
+                                }
+                            }
+                            .padding(.horizontal, 16)
+                        }
                     }
 
                     if activeFilter == .duplicates {
@@ -238,6 +262,32 @@ struct MediaCleanerView: View {
                     .accessibilityLabel("Filter hanya file lokal di memori iPhone")
 
                     Menu {
+                        ForEach(MediaSortOrder.allCases) { option in
+                            Button {
+                                HapticFeedback.selection()
+                                sortOrder = option
+                            } label: {
+                                if sortOrder == option {
+                                    Label(option.rawValue, systemImage: "checkmark")
+                                } else {
+                                    Text(option.rawValue)
+                                }
+                            }
+                        }
+                    } label: {
+                        Label(sortOrder.rawValue, systemImage: "arrow.up.arrow.down")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(sortOrder == .largestFirst ? CyberTheme.textSecondary : CyberTheme.cyberCyan)
+                            .padding(.horizontal, 12)
+                            .frame(minHeight: 40)
+                            .background(CyberTheme.elevatedSurface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                    .strokeBorder(sortOrder == .largestFirst ? CyberTheme.hairlineBorder : CyberTheme.cyberCyan, lineWidth: 1)
+                            )
+                    }
+
+                    Menu {
                         ForEach(MediaAgeFilter.allCases) { option in
                             Button {
                                 HapticFeedback.selection()
@@ -313,6 +363,10 @@ struct MediaCleanerView: View {
                 Spacer()
                 if activeFilter == .videos || activeFilter == .screenRecordings {
                     Text("Pilih video -> Kompres di bawah")
+                        .font(.caption2)
+                        .foregroundStyle(CyberTheme.cyberCyan)
+                } else if activeFilter == .largePhotos || activeFilter == .screenshots {
+                    Text("Pilih foto -> Konversi HEIC di bawah")
                         .font(.caption2)
                         .foregroundStyle(CyberTheme.cyberCyan)
                 }
@@ -745,15 +799,121 @@ struct MediaCleanerView: View {
 
 // MARK: - Breakdown, Row & Cluster Views
 
+private struct BreakdownSegment: Identifiable {
+    let id: String
+    let label: String
+    let bytes: Int64
+    let color: Color
+}
+
+private struct SmartSweepCard: View {
+    let summary: SmartSweepSummary
+    let onSelectFilter: (MediaCategoryFilter, MediaAgeFilter) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Peluang Cepat Bersih")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(CyberTheme.cyberCyan)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    if summary.heavyVideosCount > 0 {
+                        sweepPill(
+                            icon: "film",
+                            title: "Video >100MB (\(summary.heavyVideosCount))",
+                            bytes: summary.heavyVideosBytes,
+                            accent: CyberTheme.cyberCyan
+                        ) {
+                            onSelectFilter(.videos, .all)
+                        }
+                    }
+
+                    if summary.screenRecordingsCount > 0 {
+                        sweepPill(
+                            icon: "record.circle",
+                            title: "Screen Rec (\(summary.screenRecordingsCount))",
+                            bytes: summary.screenRecordingsBytes,
+                            accent: CyberTheme.crimsonText
+                        ) {
+                            onSelectFilter(.screenRecordings, .all)
+                        }
+                    }
+
+                    if summary.largePhotosCount > 0 {
+                        sweepPill(
+                            icon: "photo",
+                            title: "Foto >8MB (\(summary.largePhotosCount))",
+                            bytes: summary.largePhotosBytes,
+                            accent: CyberTheme.acidMint
+                        ) {
+                            onSelectFilter(.largePhotos, .all)
+                        }
+                    }
+
+                    if summary.oldScreenshotsCount > 0 {
+                        sweepPill(
+                            icon: "rectangle.dashed",
+                            title: "Screenshot >30H (\(summary.oldScreenshotsCount))",
+                            bytes: summary.oldScreenshotsBytes,
+                            accent: CyberTheme.cyberCyan
+                        ) {
+                            onSelectFilter(.screenshots, .olderThan30Days)
+                        }
+                    }
+                }
+            }
+        }
+        .padding(12)
+        .background(CyberTheme.elevatedSurface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(CyberTheme.cyberCyan.opacity(0.35), lineWidth: 1)
+        )
+    }
+
+    private func sweepPill(
+        icon: String,
+        title: String,
+        bytes: Int64,
+        accent: Color,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Image(systemName: icon)
+                    .font(.caption)
+                    .foregroundStyle(accent)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title)
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(CyberTheme.textPrimary)
+                    Text(ByteFormatter.string(from: bytes))
+                        .font(.caption2.weight(.semibold))
+                        .monospacedDigit()
+                        .foregroundStyle(accent)
+                }
+            }
+            .padding(.horizontal, 10)
+            .frame(minHeight: 44)
+            .background(CyberTheme.oledBlack, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(CyberTheme.hairlineBorder, lineWidth: 1)
+            )
+        }
+    }
+}
+
 private struct MediaStorageBreakdownBar: View {
     let breakdown: StorageBreakdown
 
-    private var segments: [(label: String, bytes: Int64, color: Color)] {
+    private var segments: [BreakdownSegment] {
         [
-            ("Video", breakdown.videoBytes, CyberTheme.cyberCyan),
-            ("Screen Rec", breakdown.screenRecordingBytes, CyberTheme.crimsonText),
-            ("Screenshot", breakdown.screenshotBytes, CyberTheme.acidMint),
-            ("Foto", breakdown.photoBytes, CyberTheme.textSecondary)
+            BreakdownSegment(id: "video", label: "Video", bytes: breakdown.videoBytes, color: CyberTheme.cyberCyan),
+            BreakdownSegment(id: "rec", label: "Screen Rec", bytes: breakdown.screenRecordingBytes, color: CyberTheme.crimsonText),
+            BreakdownSegment(id: "shot", label: "Screenshot", bytes: breakdown.screenshotBytes, color: CyberTheme.acidMint),
+            BreakdownSegment(id: "photo", label: "Foto", bytes: breakdown.photoBytes, color: CyberTheme.textSecondary)
         ].filter { $0.bytes > 0 }
     }
 
@@ -763,18 +923,18 @@ private struct MediaStorageBreakdownBar: View {
                 GeometryReader { geo in
                     let total = Double(breakdown.totalBytes)
                     HStack(spacing: 2) {
-                        ForEach(segments, id: \.label) { segment in
+                        ForEach(segments) { segment in
                             let fraction = max(0.02, Double(segment.bytes) / total)
                             RoundedRectangle(cornerRadius: 3, style: .continuous)
                                 .fill(segment.color)
-                                .frame(width: max(4, (geo.size.width - CGFloat(segments.count - 1) * 2) * fraction))
+                                .frame(width: max(4, (geo.size.width - CGFloat(segments.count - 1) * 2) * CGFloat(fraction)))
                         }
                     }
                 }
                 .frame(height: 8)
 
                 LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], alignment: .leading, spacing: 6) {
-                    ForEach(segments, id: \.label) { segment in
+                    ForEach(segments) { segment in
                         HStack(spacing: 6) {
                             Circle()
                                 .fill(segment.color)
@@ -814,10 +974,11 @@ private struct MediaAssetRow: View {
     }
 
     private var typeLabel: String {
+        let bitrateSuffix = item.estimatedMbps >= 1.0 ? String(format: " · %.1f Mbps", item.estimatedMbps) : ""
         if item.isVideo && item.isScreenRecording {
-            return "Screen Rec · \(ByteFormatter.durationString(item.duration))"
+            return "Screen Rec · \(ByteFormatter.durationString(item.duration))\(bitrateSuffix)"
         }
-        if item.isVideo { return "Video · \(ByteFormatter.durationString(item.duration))" }
+        if item.isVideo { return "Video · \(ByteFormatter.durationString(item.duration))\(bitrateSuffix)" }
         if item.isScreenshot { return "Screenshot · \(item.resolutionLabel)" }
         if item.isLivePhoto { return "Live Photo · \(item.resolutionLabel)" }
         if item.isLargeStaticPhoto { return "Foto Jumbo · \(item.resolutionLabel)" }
@@ -891,7 +1052,7 @@ private struct MediaAssetRow: View {
                                 Capsule().fill(CyberTheme.oledBlack)
                                 Capsule()
                                     .fill(isSelected ? CyberTheme.crimsonText : CyberTheme.cyberCyan.opacity(0.7))
-                                    .frame(width: geo.size.width * proportion)
+                                    .frame(width: geo.size.width * CGFloat(proportion))
                             }
                         }
                         .frame(height: 4)

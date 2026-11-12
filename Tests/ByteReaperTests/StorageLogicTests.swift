@@ -159,14 +159,69 @@ final class StorageLogicTests: XCTestCase {
             modifiedDate: ref.addingTimeInterval(-5 * 86_400)
         )
 
-        XCTAssertTrue(FileCategoryFilter.empty.matches(item: oldFile, referenceDate: ref))
-        XCTAssertFalse(FileCategoryFilter.empty.matches(item: recentFile, referenceDate: ref))
+        let tempFile = ScannedFileItem(
+            url: URL(fileURLWithPath: "/tmp/download.part"),
+            name: "download.part",
+            relativePath: "download.part",
+            byteSize: 2048,
+            modifiedDate: ref.addingTimeInterval(-1 * 86_400)
+        )
+        let macJunkFile = ScannedFileItem(
+            url: URL(fileURLWithPath: "/tmp/._photo.jpg"),
+            name: "._photo.jpg",
+            relativePath: "._photo.jpg",
+            byteSize: 4096,
+            modifiedDate: ref.addingTimeInterval(-1 * 86_400)
+        )
+
+        XCTAssertTrue(FileCategoryFilter.junkOrEmpty.matches(item: oldFile, referenceDate: ref))
+        XCTAssertTrue(FileCategoryFilter.junkOrEmpty.matches(item: tempFile, referenceDate: ref))
+        XCTAssertTrue(FileCategoryFilter.junkOrEmpty.matches(item: macJunkFile, referenceDate: ref))
+        XCTAssertFalse(FileCategoryFilter.junkOrEmpty.matches(item: recentFile, referenceDate: ref))
         XCTAssertTrue(FileCategoryFilter.olderThan30Days.matches(item: oldFile, referenceDate: ref))
         XCTAssertFalse(FileCategoryFilter.olderThan30Days.matches(item: recentFile, referenceDate: ref))
 
+        XCTAssertTrue(MediaAgeFilter.olderThan30Days.matches(creationDate: ref.addingTimeInterval(-31 * 86_400), referenceDate: ref))
+        XCTAssertFalse(MediaAgeFilter.olderThan30Days.matches(creationDate: ref.addingTimeInterval(-5 * 86_400), referenceDate: ref))
         XCTAssertTrue(MediaAgeFilter.olderThan6Months.matches(creationDate: ref.addingTimeInterval(-200 * 86_400), referenceDate: ref))
         XCTAssertFalse(MediaAgeFilter.olderThan6Months.matches(creationDate: ref.addingTimeInterval(-30 * 86_400), referenceDate: ref))
         XCTAssertTrue(MediaAgeFilter.olderThan1Year.matches(creationDate: ref.addingTimeInterval(-400 * 86_400), referenceDate: ref))
+    }
+
+    func testVideoCompressionEstimatorAndSmartSweepMath() {
+        let estimatedHEVC = VideoCompressionService.estimatedCompressedBytes(
+            originalBytes: 100_000_000,
+            duration: 10.0,
+            preset: .hevc1080p
+        )
+        XCTAssertGreaterThan(estimatedHEVC, 0)
+        XCTAssertLessThan(estimatedHEVC, 100_000_000)
+
+        let clampedSmall = VideoCompressionService.estimatedCompressedBytes(
+            originalBytes: 1_000_000,
+            duration: 10.0,
+            preset: .mp41080p
+        )
+        XCTAssertEqual(clampedSmall, 1_000_000)
+
+        let ref = Date(timeIntervalSince1970: 1_750_000_000)
+        let summary = SmartSweepSummary.computeFromEntries([
+            .init(isVideo: true, isScreenRecording: false, isLargeStaticPhoto: false, isScreenshot: false, creationDate: ref, byteSize: 150_000_000),
+            .init(isVideo: true, isScreenRecording: true, isLargeStaticPhoto: false, isScreenshot: false, creationDate: ref, byteSize: 40_000_000),
+            .init(isVideo: false, isScreenRecording: false, isLargeStaticPhoto: true, isScreenshot: false, creationDate: ref, byteSize: 25_000_000),
+            .init(isVideo: false, isScreenRecording: false, isLargeStaticPhoto: false, isScreenshot: true, creationDate: ref.addingTimeInterval(-40 * 86_400), byteSize: 3_000_000),
+            .init(isVideo: false, isScreenRecording: false, isLargeStaticPhoto: false, isScreenshot: true, creationDate: ref.addingTimeInterval(-2 * 86_400), byteSize: 2_000_000)
+        ], referenceDate: ref)
+
+        XCTAssertTrue(summary.hasAnyOpportunity)
+        XCTAssertEqual(summary.heavyVideosCount, 1)
+        XCTAssertEqual(summary.heavyVideosBytes, 150_000_000)
+        XCTAssertEqual(summary.screenRecordingsCount, 1)
+        XCTAssertEqual(summary.screenRecordingsBytes, 40_000_000)
+        XCTAssertEqual(summary.largePhotosCount, 1)
+        XCTAssertEqual(summary.largePhotosBytes, 25_000_000)
+        XCTAssertEqual(summary.oldScreenshotsCount, 1)
+        XCTAssertEqual(summary.oldScreenshotsBytes, 3_000_000)
     }
 
     func testLaplacianBlurDetectorDistinguishesBlurryFromSharp() {

@@ -42,6 +42,7 @@ struct ContentView: View {
 
     @State private var showBatchDeleteConfirm = false
     @State private var showBatchCompressionSheet = false
+    @State private var showBatchPhotoConversionSheet = false
     @State private var statusBanner: String?
     @State private var statusBannerShowsOpenPhotos = false
     @State private var errorAlertMessage: String?
@@ -74,6 +75,10 @@ struct ContentView: View {
 
     private var allSelectedAreVideos: Bool {
         activeTab == .media && !selectedMediaItems.isEmpty && selectedMediaItems.allSatisfy(\.isVideo)
+    }
+
+    private var allSelectedAreConvertiblePhotos: Bool {
+        activeTab == .media && !selectedMediaItems.isEmpty && selectedMediaItems.allSatisfy(\.isConvertibleStaticPhoto)
     }
 
     private var selectedMediaBytes: Int64 {
@@ -247,6 +252,17 @@ struct ContentView: View {
                 }
             )
         }
+        .sheet(isPresented: $showBatchPhotoConversionSheet) {
+            BatchPhotoConversionSheet(
+                photos: selectedMediaItems,
+                onCompleted: {
+                    selectedMediaIds.removeAll()
+                    allTimeReclaimedBytes = AllTimeReclaimedStore.totalBytes()
+                    storageSnapshot = StorageTelemetryService.readDeviceSnapshot()
+                    photoScanner.startScan()
+                }
+            )
+        }
         .confirmationDialog(
             activeTab == .media
                 ? "Pindahkan \(activeSelectionCount) media (\(ByteFormatter.string(from: activeSelectionBytes))) ke album Baru Dihapus?"
@@ -307,6 +323,27 @@ struct ContentView: View {
                             showBatchCompressionSheet = true
                         } label: {
                             Label("Kompres", systemImage: "arrow.down.right.and.arrow.up.left")
+                                .font(.subheadline.weight(.bold))
+                                .foregroundStyle(CyberTheme.cyanInk)
+                                .padding(.horizontal, 12)
+                                .frame(minHeight: 44)
+                                .background(CyberTheme.cyberCyan, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        }
+                    } else if allSelectedAreConvertiblePhotos {
+                        Button {
+                            clearCurrentSelection()
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(CyberTheme.textSecondary)
+                                .frame(width: 44, height: 44)
+                        }
+                        .accessibilityLabel("Batalkan pilihan")
+
+                        Button {
+                            showBatchPhotoConversionSheet = true
+                        } label: {
+                            Label("HEIC", systemImage: "photo.on.rectangle.angled")
                                 .font(.subheadline.weight(.bold))
                                 .foregroundStyle(CyberTheme.cyanInk)
                                 .padding(.horizontal, 12)

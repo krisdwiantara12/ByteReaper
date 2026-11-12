@@ -614,7 +614,7 @@ private struct FileRowView: View {
                                 Capsule().fill(CyberTheme.oledBlack)
                                 Capsule()
                                     .fill(isSelected ? CyberTheme.crimsonText : CyberTheme.cyberCyan.opacity(0.7))
-                                    .frame(width: geo.size.width * proportion)
+                                    .frame(width: geo.size.width * CGFloat(proportion))
                             }
                         }
                         .frame(height: 4)

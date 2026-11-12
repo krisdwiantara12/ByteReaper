@@ -96,6 +96,19 @@ enum PhotoConversionService {
             userInfo: [NSLocalizedDescriptionKey: message]
         )
     }
+
+    static func deleteOriginalAssets(ids: [String]) async throws {
+        guard !ids.isEmpty else { return }
+        let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: ids, options: nil)
+        var assets: [PHAsset] = []
+        fetchResult.enumerateObjects { asset, _, _ in
+            assets.append(asset)
+        }
+        guard !assets.isEmpty else { return }
+        try await PHPhotoLibrary.shared().performChanges {
+            PHAssetChangeRequest.deleteAssets(assets as NSArray)
+        }
+    }
 }
 
 private final class LockedPhotoIdBox: @unchecked Sendable {
@@ -114,3 +127,4 @@ private final class LockedPhotoIdBox: @unchecked Sendable {
         return value
     }
 }
+

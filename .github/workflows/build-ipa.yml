@@ -44,7 +44,7 @@ jobs:
             -scheme ByteReaper \
             -destination "id=$SIM_ID" 2>&1 | tee build-test.log || {
               echo "::error::xcodebuild test failed"
-              grep -nE "error:|fatal error:|failed" build-test.log | tail -n 40 || true
+              grep -nE "error:|fatal error:|failed" build-test.log | tail -n 20 | while IFS= read -r line; do echo "::error::$line"; done || true
               exit 1
             }
 
@@ -61,7 +61,7 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO 2>&1 | tee build-archive.log || {
               echo "::error::xcodebuild archive failed"
-              grep -nE "error:|fatal error:" build-archive.log | tail -n 40 || true
+              grep -nE "error:|fatal error:" build-archive.log | tail -n 20 | while IFS= read -r line; do echo "::error::$line"; done || true
               exit 1
             }
 

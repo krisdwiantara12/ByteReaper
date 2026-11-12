@@ -4,7 +4,7 @@ import Photos
 import UIKit
 
 /// Manages foreground batch video compression, short background grace continuation,
-/// and deferred BGProcessingTask execution while charging and idle.
+/// thermal protection, and deferred BGProcessingTask execution while charging and idle.
 @MainActor
 final class CompressionQueueService: ObservableObject {
     static let backgroundTaskIdentifier = "com.kris.storage.bytereaper.compress"
@@ -147,7 +147,7 @@ final class CompressionQueueService: ObservableObject {
 
         do {
             try await PHPhotoLibrary.shared().performChanges {
-                PHAssetChangeRequest.deleteAssets(assetsToDelete as NSFastEnumeration)
+                PHAssetChangeRequest.deleteAssets(assetsToDelete as NSArray)
             }
             let deletedIds = assetsToDelete.map(\.localIdentifier)
             let deletedSet = Set(deletedIds)
@@ -191,7 +191,9 @@ final class CompressionQueueService: ObservableObject {
     ) async {
         isProcessing = true
         isBackgroundScheduled = false
-        statusMessage = "Mengompres antrean video..."
+        statusMessage = ProcessInfo.processInfo.isLowPowerModeEnabled
+            ? "Mode Daya Rendah aktif: kompresi mungkin lebih lambat."
+            : "Mengompres antrean video..."
 
         UIApplication.shared.isIdleTimerDisabled = true
         beginGraceBackgroundTask()
@@ -208,6 +210,13 @@ final class CompressionQueueService: ObservableObject {
 
         while let index = nextQueuedJobIndex() {
             if Task.isCancelled { break }
+            if ProcessInfo.processInfo.thermalState == .critical {
+                jobs[index].status = .interrupted
+                jobs[index].errorMessage = "Suhu iPhone terlalu tinggi; dijeda otomatis demi kesehatan baterai."
+                persistJobs()
+                statusMessage = "Antrean dijeda karena suhu perangkat tinggi. Lanjutkan setelah perangkat dingin."
+                return
+            }
 
             let job = jobs[index]
             let outcome = await processSingleJob(at: index, originalJob: job)
@@ -243,7 +252,7 @@ final class CompressionQueueService: ObservableObject {
                 let deletion = await deleteOriginalsMatching(autoDeleteIds)
                 if !deletion.deletedIds.isEmpty {
                     onOriginalsDeleted(deletion.deletedIds, deletion.netSavedBytes)
-                    statusMessage = "Selesai: \(finishedCount) video dikompres, \(ByteFormatter.format(deletion.netSavedBytes)) dihemat."
+                    statusMessage = "Selesai: \(finishedCount) video dikompres, \(ByteFormatter.string(from: deletion.netSavedBytes)) dihemat."
                 } else {
                     statusMessage = "Selesai kompres \(finishedCount) video. Video asli tetap disimpan sesuai pilihan."
                 }
@@ -278,7 +287,12 @@ final class CompressionQueueService: ObservableObject {
         var paused = false
 
         while let index = nextQueuedJobIndex() {
-            if Task.isCancelled {
+            if Task.isCancelled || ProcessInfo.processInfo.thermalState == .critical {
+                if ProcessInfo.processInfo.thermalState == .critical {
+                    jobs[index].status = .interrupted
+                    jobs[index].errorMessage = "Dijeda iOS karena suhu perangkat tinggi."
+                    persistJobs()
+                }
                 paused = true
                 break
             }
@@ -306,7 +320,7 @@ final class CompressionQueueService: ObservableObject {
         }
 
         if completedCount > 0 {
-            let potentialText = ByteFormatter.format(potentialSavedBytesPendingDeletion)
+            let potentialText = ByteFormatter.string(from: potentialSavedBytesPendingDeletion)
             await NotificationReminderService.sendCompressionNotification(
                 title: "Kompresi Saat Charging Selesai",
                 body: "\(completedCount) video selesai dikompresi. Buka ByteReaper untuk hapus asli & hemat \(potentialText)."
@@ -362,7 +376,7 @@ final class CompressionQueueService: ObservableObject {
                 preset: originalJob.preset,
                 stripAudio: originalJob.stripAudio
             ) { [weak self] fraction in
-                Task { @MainActor in
+                await MainActor.run {
                     guard let self,
                           let currentIndex = self.jobs.firstIndex(where: { $0.id == jobId }),
                           self.jobs[currentIndex].status == .compressing else { return }
@@ -379,7 +393,7 @@ final class CompressionQueueService: ObservableObject {
             }
             return .completed
         } catch let failure as VideoExportFailure {
-            if let updatedIdx = jobs.firstIndex(where: { $0.id == originalJob.id }) {
+            if let updatedIdx = jobs.firstIndex(where: { $0.id == jobId }) {
                 switch failure {
                 case .interrupted(let msg):
                     jobs[updatedIdx].status = .interrupted
@@ -400,7 +414,7 @@ final class CompressionQueueService: ObservableObject {
             }
             return .failed
         } catch {
-            if let updatedIdx = jobs.firstIndex(where: { $0.id == originalJob.id }) {
+            if let updatedIdx = jobs.firstIndex(where: { $0.id == jobId }) {
                 jobs[updatedIdx].status = .failed
                 jobs[updatedIdx].errorMessage = error.localizedDescription
                 persistJobs()
@@ -422,7 +436,7 @@ final class CompressionQueueService: ObservableObject {
 
         do {
             try await PHPhotoLibrary.shared().performChanges {
-                PHAssetChangeRequest.deleteAssets(assets as NSFastEnumeration)
+                PHAssetChangeRequest.deleteAssets(assets as NSArray)
             }
             let deletedSet = Set(assets.map(\.localIdentifier))
             let netSaved = targets

@@ -55,6 +55,26 @@ enum VideoCompressionService {
         return AVAssetExportPresetMediumQuality
     }
 
+    /// Estimates compressed byte size from video duration and preset target bitrate, clamped to original bytes.
+    static func estimatedCompressedBytes(
+        originalBytes: Int64,
+        duration: TimeInterval,
+        preset: VideoCompressionPreset
+    ) -> Int64 {
+        guard originalBytes > 0, duration >= 0.5 else { return originalBytes }
+        let targetMegabitsPerSecond: Double
+        switch preset {
+        case .hevc1080p:
+            targetMegabitsPerSecond = 6.5
+        case .compact720p:
+            targetMegabitsPerSecond = 3.0
+        case .mp41080p:
+            targetMegabitsPerSecond = 9.0
+        }
+        let estimated = Int64((duration * targetMegabitsPerSecond * 1_000_000.0) / 8.0)
+        return max(1, min(originalBytes, estimated))
+    }
+
     /// Exports a compressed copy of `item.asset` and saves it into PhotoKit, reporting live progress (0...1).
     static func compressAndSave(
         item: MediaAssetItem,

@@ -52,6 +52,7 @@ enum MediaCategoryFilter: String, CaseIterable, Identifiable {
 /// Age filter applied on top of media library categories.
 enum MediaAgeFilter: String, CaseIterable, Identifiable {
     case all = "Semua Waktu"
+    case olderThan30Days = "> 30 Hari"
     case olderThan6Months = "> 6 Bulan"
     case olderThan1Year = "> 1 Tahun"
 
@@ -62,6 +63,9 @@ enum MediaAgeFilter: String, CaseIterable, Identifiable {
         switch self {
         case .all:
             return true
+        case .olderThan30Days:
+            guard let cutoff = calendar.date(byAdding: .day, value: -30, to: referenceDate) else { return false }
+            return creationDate <= cutoff
         case .olderThan6Months:
             guard let cutoff = calendar.date(byAdding: .month, value: -6, to: referenceDate) else { return false }
             return creationDate <= cutoff
@@ -70,6 +74,15 @@ enum MediaAgeFilter: String, CaseIterable, Identifiable {
             return creationDate <= cutoff
         }
     }
+}
+
+/// Sort options for ranked media cleanup inspection.
+enum MediaSortOrder: String, CaseIterable, Identifiable {
+    case largestFirst = "Terbesar"
+    case highestBitrate = "Bitrate Tinggi"
+    case oldestFirst = "Terlama"
+
+    var id: String { rawValue }
 }
 
 /// Lightweight metadata for filtering PhotoKit assets by user or smart album.
@@ -125,7 +138,7 @@ enum FileCategoryFilter: String, CaseIterable, Identifiable {
     case archive = "Arsip/IPA"
     case document = "Dokumen"
     case olderThan30Days = ">30 Hari"
-    case empty = "0 KB"
+    case junkOrEmpty = "0KB/Sampah"
     case duplicates = "Duplikat"
 
     var id: String { rawValue }
@@ -133,7 +146,7 @@ enum FileCategoryFilter: String, CaseIterable, Identifiable {
     func matches(extension ext: String) -> Bool {
         let lower = ext.lowercased()
         switch self {
-        case .all, .olderThan30Days, .empty, .duplicates:
+        case .all, .olderThan30Days, .junkOrEmpty, .duplicates:
             return true
         case .video:
             return ["mp4", "mov", "m4v", "mkv", "avi", "webm"].contains(lower)
@@ -151,8 +164,11 @@ enum FileCategoryFilter: String, CaseIterable, Identifiable {
         case .olderThan30Days:
             guard let cutoff = Calendar.current.date(byAdding: .day, value: -30, to: referenceDate) else { return false }
             return item.modifiedDate <= cutoff
-        case .empty:
-            return item.byteSize == 0
+        case .junkOrEmpty:
+            if item.byteSize == 0 || item.name.hasPrefix("._") {
+                return true
+            }
+            return ["tmp", "part", "crdownload", "bak", "log", "cache"].contains(item.fileExtension.lowercased())
         case .all, .video, .image, .archive, .document, .duplicates:
             return matches(extension: item.fileExtension)
         }
@@ -228,6 +244,14 @@ struct MediaAssetItem: DuplicateGroupable {
     var mediaTypeRaw: Int { mediaType.rawValue }
     var isVideo: Bool { mediaType == .video }
     var isLargeStaticPhoto: Bool { !isVideo && !isLivePhoto && !isScreenshot && byteSize >= 8_000_000 }
+    /// Static photos safe to batch-convert into HEIC without breaking Live Photo pairings.
+    var isConvertibleStaticPhoto: Bool { !isVideo && !isLivePhoto }
+
+    /// Average video bitrate in megabits per second; 0 for photos or clips shorter than 0.2s.
+    var estimatedMbps: Double {
+        guard isVideo, duration >= 0.2, byteSize > 0 else { return 0 }
+        return (Double(byteSize) * 8.0) / duration / 1_000_000.0
+    }
 
     var resolutionLabel: String {
         "\(pixelWidth)x\(pixelHeight)"
@@ -343,6 +367,102 @@ struct PhotoConversionResult: Equatable {
 
     var savedBytes: Int64 {
         max(0, originalBytes - convertedBytes)
+    }
+}
+
+/// Quality presets for batch static-photo HEIC conversion.
+enum PhotoConversionQuality: Double, CaseIterable, Identifiable {
+    case balanced = 0.85
+    case compact = 0.72
+
+    var id: Double { rawValue }
+
+    var label: String {
+        switch self {
+        case .balanced: return "85% Seimbang"
+        case .compact: return "72% Ultra Hemat"
+        }
+    }
+}
+
+/// High-impact cleanup opportunities derived deterministically from the scanned photo library.
+struct SmartSweepSummary: Equatable {
+    struct MetricInput: Equatable {
+        let isVideo: Bool
+        let isScreenRecording: Bool
+        let isLargeStaticPhoto: Bool
+        let isScreenshot: Bool
+        let creationDate: Date
+        let byteSize: Int64
+    }
+
+    let heavyVideosCount: Int
+    let heavyVideosBytes: Int64
+    let screenRecordingsCount: Int
+    let screenRecordingsBytes: Int64
+    let largePhotosCount: Int
+    let largePhotosBytes: Int64
+    let oldScreenshotsCount: Int
+    let oldScreenshotsBytes: Int64
+
+    var hasAnyOpportunity: Bool {
+        heavyVideosCount > 0 || screenRecordingsCount > 0 || largePhotosCount > 0 || oldScreenshotsCount > 0
+    }
+
+    static func compute(from items: [MediaAssetItem], referenceDate: Date = Date()) -> SmartSweepSummary {
+        let entries = items.map {
+            MetricInput(
+                isVideo: $0.isVideo,
+                isScreenRecording: $0.isScreenRecording,
+                isLargeStaticPhoto: $0.isLargeStaticPhoto,
+                isScreenshot: $0.isScreenshot,
+                creationDate: $0.creationDate,
+                byteSize: $0.byteSize
+            )
+        }
+        return computeFromEntries(entries, referenceDate: referenceDate)
+    }
+
+    static func computeFromEntries(_ entries: [MetricInput], referenceDate: Date = Date()) -> SmartSweepSummary {
+        let cutoff30Days = Calendar.current.date(byAdding: .day, value: -30, to: referenceDate) ?? referenceDate
+        var heavyCount = 0
+        var heavyBytes: Int64 = 0
+        var recCount = 0
+        var recBytes: Int64 = 0
+        var photoCount = 0
+        var photoBytes: Int64 = 0
+        var shotCount = 0
+        var shotBytes: Int64 = 0
+
+        for entry in entries {
+            if entry.isVideo && entry.byteSize >= 100_000_000 {
+                heavyCount += 1
+                heavyBytes += entry.byteSize
+            }
+            if entry.isVideo && entry.isScreenRecording {
+                recCount += 1
+                recBytes += entry.byteSize
+            }
+            if entry.isLargeStaticPhoto {
+                photoCount += 1
+                photoBytes += entry.byteSize
+            }
+            if entry.isScreenshot && entry.creationDate <= cutoff30Days {
+                shotCount += 1
+                shotBytes += entry.byteSize
+            }
+        }
+
+        return SmartSweepSummary(
+            heavyVideosCount: heavyCount,
+            heavyVideosBytes: heavyBytes,
+            screenRecordingsCount: recCount,
+            screenRecordingsBytes: recBytes,
+            largePhotosCount: photoCount,
+            largePhotosBytes: photoBytes,
+            oldScreenshotsCount: shotCount,
+            oldScreenshotsBytes: shotBytes
+        )
     }
 }
 
